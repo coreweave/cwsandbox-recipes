@@ -1,0 +1,54 @@
+# Secrets: never commit real keys.
+.env
+.env.*
+!.env.example
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter / marimo checkpoints
+.ipynb_checkpoints/
+__marimo__/
+
+# pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Weights & Biases
+wandb/
+*.wandb
+
+# Checkpoints and data artifacts
+checkpoints/
+outputs/
+logs/
+*.pt
+*.bin
+*.safetensors
+data/raw/
+data/processed/
+
+# SkyPilot / Ray clutter
+sky_workdir/
+*.log
+ray_logs/

@@ -1,0 +1,49 @@
+# Runner policy for the taubench-verl recipe.
+# Apply with: cwic sandbox runner policy edit <RUNNER-ID> -f infra/runner-policy.yaml
+#
+# Schema note: this deployment's policy has no max_lifetime_seconds field; the
+# platform caps max lifetime and the policy only sets the default applied when
+# a sandbox asks for nothing. Both sandboxes created by this recipe pass explicit lifetimes
+# (trainer 43200s, CPU pool per its config), so the default rarely applies.
+#
+# Sized for the two sandbox shapes this recipe creates:
+#   * GPU trainer  — cpu=32, memory=256Gi, 8xH100  (max_cpu/max_memory REJECT,
+#     not clamp, so they must cover the trainer's request)
+#   * CPU env pool — cpu=1, memory=2Gi, requests only (require_limits stays false)
+#
+# No allowed_ingress/default_ingress: this recipe declares no ingress rules.
+# The env servers' public reachability comes from HTTPS endpoint routes on
+# the runner + the create-time Service.
+#
+# The tenant rule permits same-org sandbox-to-sandbox traffic. The recipe's
+# transport is the CPU env servers' public HTTPS service URLs, not pod IPs;
+# CKS-placed env pools need Gateway API infrastructure on the cluster for the
+# runner's HTTPS endpoint routes. Clusters without it should keep the pool on
+# serverless placement (the recipe default).
+#
+# Egress carves out only the instance metadata endpoint (credential theft
+# target); everything else, including in-cluster object storage, is open.
+
+display_name: verl-taubench
+constraints:
+  resources:
+    default_cpu: "1"
+    default_memory: 2Gi
+    max_cpu: "32"
+    max_memory: 256Gi
+    max_gpu_count: "8"
+  lifecycle:
+    default_lifetime_seconds: 3600
+  network:
+    allowed_egress:
+    - cidr:
+        cidr: 0.0.0.0/0
+        except:
+        - 169.254.169.254/32
+    - tenant: TENANT_SCOPE_SAME_ORG
+    default_egress:
+    - cidr:
+        cidr: 0.0.0.0/0
+        except:
+        - 169.254.169.254/32
+    - tenant: TENANT_SCOPE_SAME_ORG

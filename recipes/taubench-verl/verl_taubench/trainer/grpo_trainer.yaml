@@ -1,0 +1,107 @@
+# GRPO trainer configuration for veRL + τ-bench on CoreWeave.
+#
+# Inherit veRL's packaged ppo_trainer so component groups (actor, rollout,
+# transfer_queue, ...) resolve when --config-path points at this directory.
+#
+# This is a reference config for a single-node run (8B model, 1 node, 8xH100).
+# Adjust rollout.* and batch sizes before scaling to larger models or more nodes.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  # GRPO uses the KL loss computed inside the actor update.
+  use_kl_in_reward: false
+
+data:
+  train_files: data/processed/train.parquet
+  val_files: data/processed/test.parquet
+  train_batch_size: 128
+  # Validation batch size; null lets veRL decide.
+  val_batch_size: null
+  max_prompt_length: 8192
+  max_response_length: 4096
+  # Return the raw chat prompt so the AgentLoop can tokenize it via Continuous
+  # Token builders and produce an aligned loss mask.
+  return_raw_chat: true
+  return_raw_input_ids: false
+  # Preserve chat-template boundaries as assistant generations are interleaved
+  # with simulated-user and environment-tool observations.
+  continuous_token:
+    enable: true
+    model_family: qwen25
+
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+    external_lib: verl_taubench
+  actor:
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    ppo_mini_batch_size: 64
+    # Required when use_dynamic_bsz is false. Keep 1 so 8-GPU YOLO
+    # (ppo_mini_batch_size=8) still divides evenly across GPUs.
+    ppo_micro_batch_size_per_gpu: 1
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: 10
+  # FSDPActorConfig is also used for the reference policy; same micro-batch
+  # assertion fires when use_kl_loss enables the ref worker.
+  ref:
+    ppo_micro_batch_size_per_gpu: 1
+    log_prob_micro_batch_size_per_gpu: 1
+  rollout:
+    name: vllm
+    # Must be async for multi-turn rollout.
+    mode: async
+    # Samples per prompt; GRPO groups these for the relative-advantage baseline.
+    n: 8
+    # Rollout sampling temperature. GRPO's learning signal is the reward
+    # VARIANCE within each group of n rollouts; hotter sampling flips more
+    # frontier tasks and keeps advantages nonzero.
+    temperature: ${oc.decode:${oc.env:ROLLOUT_TEMPERATURE,1.1}}
+    top_p: 0.95
+    # veRL 0.9.0 V1: only *_per_gpu is supported (global log_prob_micro_batch_size is deprecated).
+    log_prob_micro_batch_size_per_gpu: 1
+    # 8B model on 8xH100: use DP rather than TP at this scale to leave headroom.
+    tensor_model_parallel_size: 1
+    data_parallel_size: 8
+    max_num_batched_tokens: 8192
+    multi_turn:
+      enable: true
+      tool_config_path: config/tool_config/taubench_sandbox_tool_config.yaml
+      function_tool_path: null
+      max_assistant_turns: 12
+      max_tool_response_length: 512
+      tool_response_truncate_side: middle
+    agent:
+      default_agent_loop: tau_bench_agent
+      agent_loop_config_path: verl_taubench/trainer/agent_loop_config.yaml
+
+trainer:
+  v1:
+    # Recipe subclass uploads each saved checkpoint and registers its object-
+    # storage URI in the still-active W&B run. It otherwise retains sync mode.
+    trainer_mode: taubench_sync
+  total_epochs: 3
+  logger: ["console", "wandb"]
+  project_name: verl-taubench-coreweave
+  experiment_name: qwen2.5-7b_grpo
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: 100
+  test_freq: 50
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_hdfs_dir: null
+
+# Ray bootstrap happens outside Hydra (see scripts/train_grpo.sh); port 6379 is
+# used to avoid collision with SkyPilot's default Ray on 6380.
+ray_kwargs:
+  ray_init:
+    num_cpus: null

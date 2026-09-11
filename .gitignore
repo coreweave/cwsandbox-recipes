@@ -1,0 +1,56 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local documentation and planning
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.python-version
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Test, lint, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Generated notebook state
+.ipynb_checkpoints/
+__marimo__/
+
+# Runtime output
+wandb/
+*.wandb
+logs/
+outputs/
+checkpoints/
+ray_logs/
+sky_workdir/
+*.log
+
+# Generated datasets and model artifacts
+data/raw/
+data/processed/
+*.pt
+*.bin
+*.safetensors
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store

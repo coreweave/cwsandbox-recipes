@@ -1,0 +1,100 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "verl-taubench-coreweave"
+version = "0.1.0"
+description = "Agentic RL post-training for multi-turn search/reasoning with veRL, τ-bench, and CoreWeave."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Aayush Jaiswal" },
+]
+keywords = ["verl", "tau-bench", "reinforcement-learning", "coreweave", "vllm", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    # Core veRL stack (pins validated with `uv pip compile`).
+    # veRL 0.9+ requires transformers 5.x and numpy>=2.
+    "verl==0.9.0",
+    # veRL 0.9.0's V1 trainer imports this at runtime, but its wheel omits it.
+    "TransferQueue==0.1.8",
+    "transformers>=5.5.3,<5.11,!=5.6.0",
+    "ray[default]>=2.41.0,<3.0.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "pydantic>=2.0.0",
+    # τ-bench environment (scaffold; no PyPI package).
+    "tau_bench @ git+https://github.com/sierra-research/tau-bench.git@59a200c6d575d595120f1cb70fea53cef0632f6b",
+    # Datasets and metrics
+    "numpy>=2.0.0",
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "datasets>=2.14.0",
+    # Observability
+    "wandb==0.29.0",
+    "weave"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.6.0",
+    # verl 0.9.0 imports these at collection time but does not declare them.
+    "uvicorn>=0.30.0",
+    "fastapi>=0.110.0",
+]
+# GPU rollout backend. Install on the actual Linux/CUDA node, not on macOS.
+vllm = [
+    "vllm>=0.24.0,<0.25.0",
+    "torch>=2.6.0",
+]
+# SkyPilot is a CLI, not a library dependency of this recipe. Every skypilot>=0.9
+# release pins click<8.2 while wandb 0.29 needs click>=8.2, so they cannot share a
+# venv. Install it isolated instead: uv tool install "skypilot[kubernetes]>=0.9.0"
+# CoreWeave sandboxes for the hosted τ-bench environment plane.
+# Only needed when running the sandboxed environment track.
+sandbox = [
+    # 1.12+ unifies CKS/serverless entrypoints and adds native W&B auth.
+    # It also gives exec/log-stream/file ops a direct-to-runner data plane
+    # (AUTO by default), which removes the shared gateway from the paths
+    # that used to drop mid-run. It also requires cryptography>=42 -- see
+    # the overwrite step in scripts/train_grpo.sh.
+    "cwsandbox>=1.12.0,<2.0.0",
+    "httpx>=0.27.0",
+    # User simulator speaks the openai SDK so Weave autopatches its calls.
+    "openai>=1.40.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["verl_taubench"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+# The recipe runs on Linux (trainer) and macOS (host CLI). Resolving for other
+# platforms only adds spurious conflicts to the lockfile.
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]

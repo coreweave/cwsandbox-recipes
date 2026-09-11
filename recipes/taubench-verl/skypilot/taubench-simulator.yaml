@@ -1,0 +1,63 @@
+# SkyServe deployment: the τ-bench user simulator.
+#
+# The simulator is an LLM endpoint, not environment code, so it lives here rather
+# than inside the environment sandbox. It is the hidden cost centre of τ-bench:
+# every episode burns simulator tokens, and unlike policy tokens they produce no
+# gradient. Budget for it explicitly.
+#
+# Environments with no simulated user (for example document-retrieval tasks) have
+# no simulator cost at all, which is a large part of why they are cheaper per episode.
+#
+# Usage:
+#   sky serve up -n taubench-sim skypilot/taubench-simulator.yaml
+#   export TAUBENCH_SIMULATOR_URL=$(sky serve status taubench-sim --endpoint)
+#
+# Alternative: skip this file entirely and point TAUBENCH_SIMULATOR_URL at a
+# hosted OpenAI-compatible API. The tool only needs /v1/chat/completions.
+
+name: taubench-simulator
+
+service:
+  readiness_probe:
+    path: /v1/models
+    initial_delay_seconds: 900
+  # Scale with concurrent episodes. Each in-flight episode holds at most one
+  # outstanding simulator request, so replicas track pool size / batching.
+  replicas: 2
+
+resources:
+  infra: k8s
+  # A small instruct model is sufficient; the simulator only produces short user
+  # turns. Do not spend H100s here -- this competes with the trainer for GPUs.
+  accelerators: L40S:1
+  memory: 64+
+  disk_size: 200
+  ports: 8000
+
+envs:
+  SIM_MODEL: "Qwen/Qwen2.5-7B-Instruct"
+  MAX_MODEL_LEN: "8192"
+
+secrets:
+  HF_TOKEN: null
+
+setup: |
+  #!/bin/bash -e
+  set -x
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  uv pip install "vllm>=0.24.0,<0.25.0"
+
+run: |
+  #!/bin/bash -e
+  set -x
+  export PATH="$HOME/.local/bin:$PATH"
+
+  # OpenAI-compatible server; OpenAICompatibleSimulator posts to
+  # {base_url}/v1/chat/completions.
+  python -m vllm.entrypoints.openai.api_server \
+    --model "${SIM_MODEL}" \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --served-model-name "${SIM_MODEL}"

@@ -1,0 +1,18 @@
+display_name: verl-h100
+description: "taubench-verl GPU trainer: H100 nodes in example-nodepool"
+spec:
+  namespace:
+    strategy: per-user
+  network:
+    egress:
+      default: internet
+      modes:
+        internet:
+          type: internet
+  runtimeClass: nvidia
+  pod:
+    spec:
+      nodeSelector:
+        compute.coreweave.com/compute-class: default
+        compute.coreweave.com/node-pool: example-nodepool
+        gpu.nvidia.com/class: H100_NVLINK_80GB

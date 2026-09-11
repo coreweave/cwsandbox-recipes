@@ -1,0 +1,91 @@
+# Tool configuration for τ-bench multi-turn rollout with a SANDBOXED environment.
+#
+# The τ-bench database and tool API run inside a CoreWeave sandbox. Two
+# components deliberately stay OUTSIDE it:
+#   - the user simulator (an LLM endpoint on the inference fleet)
+#   - the policy rollout (the vLLM/SGLang fleet)
+#
+# Pool sizing is per tool process/instance: in-flight episodes are
+# data.train_batch_size * rollout.n, so set pool.size to at least that for full
+# concurrency. Validation may lazily construct another pool keyed to test split.
+tools:
+  - class_name: "verl_taubench.tools.sandbox_taubench_tool.SandboxTauBenchTool"
+    config:
+      type: native
+      tool_schemas: []
+      # Hard cap on user turns per episode; a runaway simulator loop otherwise
+      # burns tokens until max_assistant_turns.
+      max_user_turns: 30
+
+      pool:
+        # The single home for pool size (see the sizing note above). Override at
+        # runtime with TAUBENCH_POOL_SIZE (positive int).
+        size: 64
+        acquire_timeout_s: 300.0
+        reset_timeout_s: 60.0
+        max_provision_retries: 2
+        # HTTP client ceiling is always >= max(size, 512). TAUBENCH_MAX_CONNECTIONS
+        # can request more, but cannot lower that floor.
+
+      backend:
+        domain: "${oc.env:TAUBENCH_DOMAIN,retail}"
+        task_split: "${oc.env:TAUBENCH_TASK_SPLIT,train}"
+        # Graded credit for failed train episodes: reward = weight x progress
+        # over the ground-truth actions (right tool = half credit, rest from
+        # correct arguments) and the required outputs. Strict binary reward
+        # makes whole GRPO groups uniform and zeroes every advantage; 0
+        # restores strict. Validation always stays strict.
+        partial_credit: "${oc.env:TAUBENCH_PARTIAL_CREDIT,0.3}"
+        # Default CPU image; per-sandbox `pip install tau-bench` runs on startup.
+        # Set TAUBENCH_ENV_IMAGE to a baked image to skip install and override this value.
+        container_image: "python:3.11"
+        env_port: 8080
+        cpu: "${oc.env:TAUBENCH_ENV_CPU,4}"
+        memory: "${oc.env:TAUBENCH_ENV_MEMORY,8Gi}"
+        max_lifetime_seconds: 43200
+        # The pool needs a public HTTPS Service to reach /health. Serverless is
+        # the default because a runner without Gateway API has no HTTPS endpoint
+        # routes and rejects those creates. Set CWSANDBOX_PLACEMENT_MODE=cks on a
+        # cluster that has them.
+        placement_mode: "${oc.env:CWSANDBOX_PLACEMENT_MODE,serverless}"
+        # Spillover only applies from CKS; under serverless it must stay unset.
+        placement_spillover: "${oc.env:CWSANDBOX_PLACEMENT_SPILLOVER,null}"
+        # The env server binds within seconds, but the public LoadBalancer data
+        # path can take minutes to become routable on a cold start. 120s (the
+        # code default) flakes; probe longer before declaring the sandbox dead.
+        readiness_timeout_s: 420.0
+        # GPU sandbox launches always inject a unique value. The explicit
+        # fallback remains narrow and is never used for broad process-exit reaping.
+        tags:
+          - "${oc.env:TAUBENCH_ENV_TAG,verl-taubench-env-unscoped}"
+
+      simulator:
+        # Any OpenAI-compatible endpoint. Default: W&B Inference (serverless,
+        # authenticated with WANDB_API_KEY); Weave autopatches the call so the
+        # user simulator shows as an LLM chat span in every rollout trace.
+        base_url: "${oc.env:TAUBENCH_SIMULATOR_URL,https://api.inference.wandb.ai/v1}"
+        # Must match a model the endpoint serves. For a self-hosted simulator
+        # set the model vLLM serves (SIM_MODEL in skypilot/taubench-simulator.yaml).
+        model: "${oc.env:TAUBENCH_SIMULATOR_MODEL,meta-llama/Llama-3.1-8B-Instruct}"
+        temperature: 1.0
+        max_tokens: 256
+        # Concurrent simulator calls per rollout worker. Hosted endpoints
+        # cap per-user concurrency; total pressure is workers x this value.
+        concurrency: "${oc.env:TAUBENCH_SIMULATOR_CONCURRENCY,4}"
+    tool_schema:
+      type: "function"
+      function:
+        name: "tau_bench_step"
+        description: "Execute one action in the τ-bench environment. Use action_name='respond' to message the user."
+        parameters:
+          type: "object"
+          properties:
+            action_name:
+              type: "string"
+              description: "Name of the τ-bench action to call (or 'respond')."
+            action_kwargs:
+              type: "object"
+              description: "Arguments for the chosen action. For 'respond', use {'content': '...'}."
+          required:
+            - action_name
+            - action_kwargs

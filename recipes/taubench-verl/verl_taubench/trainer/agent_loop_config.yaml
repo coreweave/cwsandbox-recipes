@@ -1,0 +1,5 @@
+# Custom agent loops registered for veRL multi-turn rollout.
+# This file is referenced by ``actor_rollout_ref.rollout.agent.agent_loop_config_path``.
+- name: tau_bench_agent
+  _target_: verl_taubench.agent.taubench_loop.TauBenchAgentLoop
+  max_turns: 12

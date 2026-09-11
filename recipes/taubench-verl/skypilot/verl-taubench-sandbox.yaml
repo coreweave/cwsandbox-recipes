@@ -1,0 +1,144 @@
+# SkyPilot task: veRL + τ-bench GRPO with a SANDBOXED environment plane.
+#
+# Three workloads with independently scalable shapes:
+#
+#   1. Trainer + rollout  -- this task. GPU, gang-scheduled. Ray on 6379.
+#   2. User simulator     -- separate SkyServe deployment (see skypilot/taubench-simulator.yaml).
+#                            NOT in the sandbox: it is an LLM endpoint, not env code.
+#   3. Environment plane  -- a cwsandbox Session holding a warm pool of τ-bench
+#                            env servers. Provisioned from inside the trainer
+#                            process by SandboxPool, not by SkyPilot.
+#
+# Ray port collision is the #1 failure mode: SkyPilot runs its own Ray on 6380,
+# so veRL's Ray must be on 6379 and we never call ray.init(address="auto").
+#
+# Usage:
+#   # 1. Stand up the user simulator first and capture its endpoint.
+#   sky serve up -n taubench-sim skypilot/taubench-simulator.yaml
+#   export TAUBENCH_SIMULATOR_URL=$(sky serve status taubench-sim --endpoint)
+#
+#   # 2. Launch the trainer.
+#   sky launch -c verl-taubench-sbx skypilot/verl-taubench-sandbox.yaml \
+#       --secret WANDB_API_KEY \
+#       --secret HF_TOKEN \
+#       --env TAUBENCH_SIMULATOR_URL=$TAUBENCH_SIMULATOR_URL
+
+name: verl-taubench-sandbox
+
+num_nodes: 1
+
+resources:
+  infra: k8s
+  accelerators: H100:8
+  memory: 256+
+  disk_size: 500
+  use_spot: false
+  # Same image as the GPU-sandbox track: ships verl, vllm, torch, ray, and
+  # flash-attn prebuilt. Installing that stack with pip inside a bare pod
+  # misses the CUDA flash-attn build.
+  image_id: docker:verlai/verl:vllm024.dev2
+  # Single-node task; network_tier is optional on CoreWeave K8s.
+  network_tier: best
+
+# Ship the repo to the cluster. Without this, `run:` executes in an empty
+# ~/sky_workdir and every path below is wrong.
+workdir: .
+
+envs:
+  # Pods have node networking, so they can use the LOTA cache. Sandboxes cannot
+  # and use https://cwobject.com instead.
+  CW_ENDPOINT: "http://cwlota.com"
+  CW_BUCKET: "verl-taubench-checkpoints"
+  WANDB_PROJECT: "verl-taubench-coreweave"
+  # Pool size should be >= train_batch_size * rollout.n for full concurrency.
+  TAUBENCH_POOL_SIZE: "128"
+  TAUBENCH_ENV_CPU: "4"
+  TAUBENCH_ENV_MEMORY: "8Gi"
+  TAUBENCH_DOMAIN: "retail"
+  TAUBENCH_TASK_SPLIT: "train"
+  # OpenAI-compatible user simulator. Default: W&B Inference (serverless,
+  # authenticated with WANDB_API_KEY). Point at a `sky serve` deployment to
+  # self-host, or at https://api.openai.com/v1 with OPENAI_API_KEY.
+  TAUBENCH_SIMULATOR_URL: "https://api.inference.wandb.ai/v1"
+  TAUBENCH_SIMULATOR_MODEL: "meta-llama/Llama-3.1-8B-Instruct"
+  MODEL_PATH: "Qwen/Qwen2.5-7B-Instruct"
+  N_GPUS: "8"
+  TOTAL_EPOCHS: "3"
+  # Set to weave for per-turn rollout traces in W&B Weave.
+  TRACE_BACKEND: ""
+  WANDB_ENTITY: ""
+  CWSANDBOX_SERVERLESS_AUTH: "wandb"
+
+secrets:
+  CWSANDBOX_API_KEY: ""    # required for CKS or serverless with coreweave auth
+  WANDB_API_KEY: null      # metrics, W&B Inference, and serverless CPU sandbox auth
+  HF_TOKEN: null
+  CW_ACCESS_KEY: null   # optional; CoreWeave Object Storage checkpoints
+  CW_SECRET_KEY: null
+  OPENAI_API_KEY: ""    # only when the simulator uses api.openai.com
+
+setup: |
+  #!/bin/bash -e
+  set -x
+
+  # The image carries the training stack; add only the recipe + env plane.
+  # cwsandbox >=1.9 needs cryptography>=42; the image's copy is a distro
+  # package pip cannot uninstall, so overwrite it in place.
+  python -m pip install --quiet --ignore-installed "cryptography>=42.0.0"
+  python -m pip install --quiet -e ".[sandbox]"
+
+  python -c "import verl, vllm, ray, torch; print('veRL:', verl.__version__)"
+  python -c "import cwsandbox; print('cwsandbox:', cwsandbox.__version__)"
+  # Match the W&B pin in pyproject.toml and fail before downloading models.
+  python -c "import wandb; from wandb.sdk.lib.runid import generate_id; print('wandb:', wandb.__version__); assert wandb.__version__ == '0.29.0'; assert generate_id()"
+
+  # Pre-download the base model so every GPU worker sees the same path.
+  python - <<'PY'
+  import os
+  from transformers import AutoTokenizer
+  from huggingface_hub import snapshot_download
+
+  model = os.environ.get("MODEL_PATH", "Qwen/Qwen2.5-7B-Instruct")
+  AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+  snapshot_download(model, token=os.environ.get("HF_TOKEN"))
+  print("Model cache ready:", model)
+  PY
+
+run: |
+  #!/bin/bash -e
+  set -x
+  export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+
+  # Disable xtrace while reading or generating secret values. Tokens stay in
+  # environment variables and never appear in argv or task logs.
+  set +x
+  : "${WANDB_API_KEY:?WANDB_API_KEY missing}"
+  : "${HF_TOKEN:?HF_TOKEN missing}"
+  : "${TAUBENCH_SIMULATOR_URL:?TAUBENCH_SIMULATOR_URL missing}"
+  if [ "${CWSANDBOX_PLACEMENT_MODE:-serverless}" = "cks" ] || [ "${CWSANDBOX_SERVERLESS_AUTH:-wandb}" = "coreweave" ]; then
+    : "${CWSANDBOX_API_KEY:?CWSANDBOX_API_KEY missing for CoreWeave sandbox auth}"
+  fi
+
+  # Per-job bearer token and exact cleanup tag for the in-sandbox env servers.
+  # Always replace any inherited tag; sharing a fallback would let one job reap
+  # another job's sandboxes.
+  export TAUBENCH_ENV_TOKEN="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+  export TAUBENCH_ENV_TAG="verl-taubench-env-$(python -c 'import uuid;print(uuid.uuid4())')"
+  set -x
+
+  # Dataset generation runs on CPU and needs no LLM (user_strategy="human").
+  if [ ! -f data/processed/train.parquet ]; then
+    python scripts/preprocess_taubench.py \
+      --domain "${TAUBENCH_DOMAIN}" --task-split train --local-save-dir ./data/processed
+  fi
+  if [ ! -f data/processed/test.parquet ]; then
+    python scripts/preprocess_taubench.py \
+      --domain "${TAUBENCH_DOMAIN}" --task-split test --end-index 50 --local-save-dir ./data/processed
+  fi
+
+  # Fail fast on sandbox reachability before burning GPU hours: provisions ONE
+  # sandbox, checks /health, tears it down.
+  python -m verl_taubench.sandbox.preflight \
+    --domain "${TAUBENCH_DOMAIN}" --task-split "${TAUBENCH_TASK_SPLIT}"
+
+  bash scripts/train_grpo.sh "trainer.total_epochs=${TOTAL_EPOCHS:-3}"

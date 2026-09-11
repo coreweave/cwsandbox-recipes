@@ -1,0 +1,11 @@
+display_name: verl-cpu
+description: "taubench-verl CPU env pool: no placement constraints"
+spec:
+  namespace:
+    strategy: per-user
+  network:
+    egress:
+      default: internet
+      modes:
+        internet:
+          type: internet
