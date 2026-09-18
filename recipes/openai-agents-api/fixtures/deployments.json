@@ -1,0 +1,24 @@
+{
+  "synthetic": true,
+  "service": "demo-inference",
+  "cutoff": "2026-01-15T15:30:00Z",
+  "deployments": [
+    {
+      "deployment_id": "deploy-a",
+      "timestamp": "2026-01-15T14:00:00Z",
+      "regions": [
+        "east",
+        "west"
+      ],
+      "change": "Baseline demo release"
+    },
+    {
+      "deployment_id": "deploy-b",
+      "timestamp": "2026-01-15T15:30:00Z",
+      "regions": [
+        "west"
+      ],
+      "change": "Synthetic scheduler configuration update"
+    }
+  ]
+}
