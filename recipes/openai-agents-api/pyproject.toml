@@ -1,0 +1,18 @@
+[project]
+name = "cwsandbox-openai-agents-api-recipe"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["cwsandbox[wandb]==1.14.2", "openai==3.14.1", "python-dotenv==1.1.1"]
+
+[dependency-groups]
+dev = ["pytest==8.4.2", "ruff==0.12.12"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
