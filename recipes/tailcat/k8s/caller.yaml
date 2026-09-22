@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cks-caller
+  namespace: tailcat-demo
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  template:
+    metadata:
+      labels: {app: cks-caller}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: caller
+          image: ${TAILCAT_IMAGE}
+          command: [sh, -ec]
+          args:
+            - |
+              umask 077
+              mkdir -p /tmp/tailcat
+              tailcat --key=new forward --bind=127.0.0.1 \
+                "$(cat /var/run/tailcat/address)" 18081:8081 \
+                >/tmp/tailcat/forward.log 2>&1 &
+              forward_pid=$!
+              trap 'kill "$forward_pid" 2>/dev/null || true' EXIT
+              trap 'exit 143' TERM
+              trap 'exit 130' INT
+              curl --fail --silent --show-error \
+                --retry 20 --retry-all-errors --retry-delay 1 \
+                --retry-max-time 120 --max-time 15 \
+                "http://127.0.0.1:18081${REQUEST_PATH}"
+          env:
+            - {name: REQUEST_PATH, value: /}
+          volumeMounts:
+            - {name: address, mountPath: /var/run/tailcat, readOnly: true}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+      volumes:
+        - name: address
+          secret:
+            secretName: sandbox-tailcat
+            defaultMode: 0440
