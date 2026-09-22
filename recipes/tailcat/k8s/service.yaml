@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tailcat-demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cks-api
+  namespace: tailcat-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cks-api}
+  template:
+    metadata:
+      labels: {app: cks-api}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: api
+          image: ${TAILCAT_IMAGE}
+          command: [sh, -ec]
+          args:
+            - |
+              mkdir -p /tmp/http
+              printf 'hello from CKS\n' >/tmp/http/index.html
+              exec python -m http.server 8080 --bind 0.0.0.0 --directory /tmp/http
+          ports:
+            - {name: http, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /, port: http}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: "1", memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cks-api
+  namespace: tailcat-demo
+spec:
+  type: ClusterIP
+  selector: {app: cks-api}
+  ports:
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}

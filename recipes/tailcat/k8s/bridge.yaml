@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cks-bridge
+  namespace: tailcat-demo
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: cks-bridge}
+  template:
+    metadata:
+      labels: {app: cks-bridge}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: service-forward
+          image: ${TAILCAT_IMAGE}
+          command: [socat]
+          args:
+            - TCP4-LISTEN:18080,bind=127.0.0.1,reuseaddr,fork
+            - TCP:cks-api.tailcat-demo.svc.cluster.local:8080
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: "1", memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+        - name: tailcat
+          image: ${TAILCAT_IMAGE}
+          command: [sh, -ec]
+          args:
+            - |
+              umask 077
+              mkdir -p /tmp/tailcat
+              exec tailcat --json serve --key=new --full-address 18080 \
+                >/tmp/tailcat/address.json 2>/tmp/tailcat/serve.log
+          readinessProbe:
+            exec:
+              command: [sh, -ec, "test -s /tmp/tailcat/address.json"]
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}

@@ -1,0 +1,18 @@
+[project]
+name = "cwsandbox-tailcat-recipe"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["cwsandbox==1.14.3"]
+
+[dependency-groups]
+dev = ["pytest==8.4.2", "ruff==0.12.12", "pyyaml==6.0.3"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
