@@ -9,6 +9,7 @@ Sandboxes are isolated compute environments with serverless and CoreWeave Kubern
 | Recipe | What it shows | Hardware |
 |---|---|---|
 | [`tailcat`](recipes/tailcat/) | Connect Serverless Sandboxes to a private CKS Service with Tailcat, including reverse connections and a round trip. | CPU only |
+| [`github-actions`](recipes/github-actions/) | Run public repository tests in disposable sandboxes from GitHub Actions, with optional advisory AI review. | CPU only |
 | [`warm-pool`](recipes/warm-pool/) | Reduce startup latency for concurrent workloads with ready sandboxes and automatic replenishment. Includes a live comparison, isolation checks, and snapshot guidance. | CPU only |
 | [`openai-agents-api`](recipes/openai-agents-api/) | Investigate synthetic inference telemetry with an OpenAI Agent coordinator and three subagents; verify metrics, delegation, turn overlap, and cleanup. | CPU only |
 | [`taubench-verl`](recipes/taubench-verl/) | RL training (GRPO) of a tool-using agent on tau-bench with veRL. GPU sandbox or optional SkyPilot/CKS trainer; per-worker CPU sandbox pools, serverless by default. W&B Models metrics, optional Weave traces, and checkpoint reference artifacts. | 8x H100 + CPU pools |
