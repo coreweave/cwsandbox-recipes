@@ -122,3 +122,94 @@ def test_report_escapes_untrusted_output(monkeypatch, tmp_path, capsys):
     assert "::error::" not in capsys.readouterr().out
     assert "<script>" not in summary.read_text()
     assert "&lt;script&gt;" in summary.read_text()
+
+
+def test_failure_annotation_does_not_include_sandbox_output(monkeypatch, tmp_path, capsys):
+    malicious = "::error::injected annotation\n</pre><script>bad()</script>"
+    fake_sandbox(monkeypatch, SimpleNamespace(returncode=1, stdout=malicious, stderr=malicious))
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert run.run(run.parse_args(["--output", str(tmp_path)])) == 1
+    console = capsys.readouterr().out
+    assert console.count("::error::") == 1
+    assert (
+        "::error::Sandbox CI failed. See the job summary and sandbox-ci-results artifact."
+        in console
+    )
+    assert "injected annotation" not in console
+    assert "<script>" not in console
+
+
+def test_truncation_preserves_failure_at_end(monkeypatch, tmp_path):
+    output = "install noise\n" * 4000 + "AssertionError: expected 5, got -1\n"
+    fake_sandbox(monkeypatch, SimpleNamespace(returncode=1, stdout=output, stderr=output))
+    assert run.run(run.parse_args(["--output", str(tmp_path)])) == 1
+    report = json.loads((tmp_path / "result.json").read_text())
+    assert report["output_truncated"] is True
+    for field in ("stdout", "stderr"):
+        assert len(report[field]) == run.OUTPUT_LIMIT
+        assert report[field].endswith("AssertionError: expected 5, got -1\n")
+
+
+def test_environment_template_preserves_exported_values():
+    import os
+    import subprocess
+
+    names = ("CWSANDBOX_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "SANDBOX_REVIEW_MODEL")
+    env = dict(os.environ, **{name: "existing-value" for name in names})
+    script = 'set -a; source "$1"; set +a; ' + " && ".join(
+        f'test "${{{name}}}" = existing-value' for name in names
+    )
+    subprocess.run(
+        ["bash", "-c", script, "bash", str(run.ROOT / ".env.example")], env=env, check=True
+    )
+
+
+def test_documented_ci_copy_keeps_pytest_collection_clean(tmp_path):
+    import re
+    import subprocess
+    import sys
+
+    readme = (run.ROOT / "README.md").read_text()
+    setup = readme.split("## Add to GitHub Actions", 1)[1]
+    commands = re.search(r"```bash\n(.*?)\n\s*```", setup, re.DOTALL).group(1)
+    commands = commands.replace("[RECIPES-CHECKOUT]", str(run.ROOT.parent.parent))
+    subprocess.run(["bash", "-eu", "-c", commands], cwd=tmp_path, check=True)
+    (tmp_path / "test_application.py").write_text(
+        "def test_application():\n    assert 2 + 3 == 5\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 test collected" in result.stdout
+    assert "test_application.py::test_application" in result.stdout
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    ignored = subprocess.run(
+        ["git", "check-ignore", "ci/sandbox/.env", "ci/sandbox/outputs/result.json"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert ignored.stdout.splitlines() == ["ci/sandbox/.env", "ci/sandbox/outputs/result.json"]
+
+
+@pytest.mark.parametrize("override", [None, "claude-sonnet-4-6"])
+def test_review_model_setting_is_scoped_and_returns_text(monkeypatch, override):
+    import io
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-placeholder")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "unrelated-tool-model")
+    monkeypatch.delenv("SANDBOX_REVIEW_MODEL", raising=False)
+    if override:
+        monkeypatch.setenv("SANDBOX_REVIEW_MODEL", override)
+    response = io.BytesIO(json.dumps({"content": [{"type": "text", "text": "Advisory"}]}).encode())
+    request = Mock(return_value=response)
+    monkeypatch.setattr(run.urllib.request, "urlopen", request)
+    assert run.review("diff", {"returncode": 0, "stdout": "", "stderr": ""}) == "Advisory"
+    payload = json.loads(request.call_args.args[0].data)
+    assert payload["model"] == (override or "claude-sonnet-5")
+    assert payload["thinking"] == {"type": "disabled"}

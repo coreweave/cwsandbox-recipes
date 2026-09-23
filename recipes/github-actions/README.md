@@ -30,7 +30,7 @@ The sandbox receives no CoreWeave, GitHub, or Anthropic credentials. Git fetches
 - A public GitHub repository for repository mode. The bundled sample needs no repository access.
 - Optional: an [Anthropic API key](https://console.anthropic.com/settings/keys) for `--review`.
 
-This recipe explicitly uses CoreWeave authentication and billing. A W&B key is not a substitute for `CWSANDBOX_API_KEY`.
+This recipe explicitly uses CoreWeave authentication. A W&B key is not a substitute for `CWSANDBOX_API_KEY`.
 
 ## Setup
 
@@ -38,10 +38,15 @@ From this directory:
 
 ```bash
 uv sync --locked
+```
+
+If `CWSANDBOX_API_KEY` is already exported, use it as-is. Otherwise, copy the environment template:
+
+```bash
 cp .env.example .env
 ```
 
-Replace the CoreWeave token placeholder in `.env`. Replace the Anthropic placeholder only if you plan to use `--review`. Load the file into your shell:
+In `.env`, uncomment `CWSANDBOX_API_KEY` and replace its placeholder with your token. Uncomment and set `ANTHROPIC_API_KEY` only if you need it for `--review`. Leave variables you already export commented out, then load the file:
 
 ```bash
 set -a
@@ -103,26 +108,36 @@ Review sends up to 24,000 characters each of the diff, stdout, and stderr to Ant
 
 ## Add to GitHub Actions
 
-1. Copy this entire directory into `ci/sandbox/` in your public repository, excluding `.venv`, `.env`, caches, and `outputs`. The directory is self-contained and works outside this recipes repository.
-2. Copy `workflow.yml` to `.github/workflows/sandbox-ci.yml`.
+1. From the root of your public repository, copy only the runtime files. Replace `[RECIPES-CHECKOUT]` with the path to your `cwsandbox-recipes` clone:
+
+   ```bash
+   recipe_dir="[RECIPES-CHECKOUT]/recipes/github-actions"
+   mkdir -p ci/sandbox .github/workflows
+   cp "$recipe_dir/run.py" "$recipe_dir/pyproject.toml" \
+     "$recipe_dir/uv.lock" "$recipe_dir/.gitignore" ci/sandbox/
+   cp "$recipe_dir/workflow.yml" .github/workflows/sandbox-ci.yml
+   ```
+
+   Keep the recipe's `tests/` and `sample/` directories out of your project so `pytest` doesn't collect them. This runtime-only copy supports repository mode (`--repo` and `--head`); run the bundled sample from the original recipes checkout.
+2. Review `.github/workflows/sandbox-ci.yml`.
 3. Replace the workflow's `--command` with your project's dependency installation and test command. Its default uses Python's standard-library `unittest` runner.
 4. Create a repository Actions secret named `CWSANDBOX_API_KEY` containing the CoreWeave token.
 5. Merge the orchestration files and workflow into the PR's base branch before opening a test PR. The workflow deliberately reads these files from `github.event.pull_request.base.sha`.
 6. Open or update a same-repository PR. Inspect the **Sandbox CI** check's job summary and download the **sandbox-ci-results** artifact.
 
-The workflow runs on `opened`, `synchronize`, and `reopened` pull request events. It skips fork PRs, Dependabot PRs, and private repositories. GitHub does not supply repository secrets to fork or Dependabot pull request workflows. Use this template for trusted repository contributors; collaborators who can change workflows can also change how secrets are used. Do not enable it for fork code by switching to `pull_request_target`.
+The workflow runs on `opened`, `synchronize`, and `reopened` pull request events. It skips fork PRs, Dependabot PRs, and private repositories. GitHub does not supply repository secrets to fork or Dependabot pull request workflows. A skipped job satisfies a required status check, so requiring this check does not enforce tests for the skipped PRs. See [GitHub required-check behavior](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#handling-skipped-but-required-checks). Use this template for trusted repository contributors. Do not enable it for fork code by switching to `pull_request_target`.
 
-Only trusted base-branch orchestration is installed on the Actions runner. The PR head is fetched and executed inside the sandbox. The workflow tests the head commit itself, not GitHub's synthetic merge commit. It requests `contents: read`, disables persisted checkout credentials, and does not post PR comments.
+The supplied workflow checks out `run.py` and its dependency files from the base commit. The workflow definition itself comes from the PR merge ref: a same-repository PR can change the workflow, test command, checkout ref, and use of secrets. The base checkout is not protection against a collaborator who can change workflows. With the supplied workflow, the PR head is fetched and executed inside the sandbox. The workflow tests the head commit itself, not GitHub's synthetic merge commit. It requests `contents: read`, disables persisted checkout credentials, and does not post PR comments.
 
-To enable AI review in the workflow, add an `ANTHROPIC_API_KEY` repository secret, expose it only on the **Run tests in a sandbox** step, and add `--review` to that step's command. Optionally set `ANTHROPIC_MODEL` to a model your account can use.
+To enable AI review in the workflow, add an `ANTHROPIC_API_KEY` repository secret, expose it only on the **Run tests in a sandbox** step, and add `--review` to that step's command. The default review model is `claude-sonnet-5`, with thinking disabled to reserve the output budget for advisory text. Optionally set `SANDBOX_REVIEW_MODEL` to a model your account can use; this recipe does not read or set `ANTHROPIC_MODEL`.
 
 ## Results and limits
 
-`result.json` includes the tested SHA, sandbox ID, test return code, bounded stdout/stderr, and cleanup outcome. `summary.md` escapes returned text for display. In Actions, the same summary is appended to `GITHUB_STEP_SUMMARY`; artifacts upload even when tests fail and expire after seven days. Test output is not printed to the runner console, preventing returned `::error::` or other workflow commands from being interpreted there.
+`result.json` includes the tested SHA, sandbox ID, test return code, the last 24,000 characters each of stdout and stderr, and cleanup outcome. `summary.md` escapes returned text for display. In Actions, the same summary is appended to `GITHUB_STEP_SUMMARY`; artifacts upload even when tests fail and expire after seven days. Test output is not printed to the runner console, preventing returned `::error::` or other workflow commands from being interpreted there. On failure in Actions, the script emits a fixed-text error annotation directing you to the summary and artifact.
 
 The test command times out after 120 seconds by default (`--timeout` accepts 1–300). Setup commands each have a 120-second timeout, startup polling allows 180 seconds, and the sandbox lifetime is capped at 900 seconds. The runner job has a 20-minute timeout. These are separate limits.
 
-This example buffers SDK command results before truncating stored output. Use it for small repositories and bounded-output test suites. It does not install Git LFS objects, initialize submodules, provide private package credentials, or enforce a sandbox network allowlist. Tests can access the network allowed by serverless policy. An attacker can falsify their own test output; a passing check is not proof that code is safe.
+This example buffers SDK command results before truncating stored output. A timed-out command is recorded as `status: error` with `error: SandboxTimeoutError`; partial command output is not captured. Use it for small repositories and bounded-output test suites. It does not install Git LFS objects, initialize submodules, provide private package credentials, or enforce a sandbox network allowlist. Tests can access the network allowed by serverless policy. An attacker can falsify their own test output; a passing check is not proof that code is safe.
 
 ## Cleanup
 
