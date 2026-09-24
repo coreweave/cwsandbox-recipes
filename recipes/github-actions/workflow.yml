@@ -1,0 +1,50 @@
+name: Sandbox CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Forks and Dependabot do not receive the sandbox secret.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out base-branch orchestration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.18"
+          python-version: "3.12"
+      - name: Install orchestration dependencies
+        run: uv sync --locked --no-dev --project ci/sandbox
+      - name: Run tests in a sandbox
+        env:
+          CWSANDBOX_API_KEY: ${{ secrets.CWSANDBOX_API_KEY }}
+          PR_REPO: ${{ github.repository }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: >-
+          uv run --locked --no-dev --project ci/sandbox python ci/sandbox/run.py
+          --repo "$PR_REPO" --head "$PR_HEAD" --base "$PR_BASE"
+          --command 'python -m unittest discover -v'
+          --output outputs
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sandbox-ci-results
+          path: outputs/
+          if-no-files-found: warn
+          retention-days: 7
