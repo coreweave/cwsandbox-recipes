@@ -1,0 +1,32 @@
+# Complete SUNK Self-Service user provisioning before applying this example:
+# https://docs.coreweave.com/products/sunk/tutorials/get-started-with-sunkcluster-cr
+# Replace the version placeholders with a supported SUNK / Slurm version pair.
+apiVersion: sunk.coreweave.com/v1alpha1
+kind: SunkCluster
+metadata:
+  name: nemo-rl
+  namespace: tenant-slurm
+spec:
+  sunkVersion: "REPLACE_WITH_SUPPORTED_SUNK_VERSION"
+  slurmVersion: "REPLACE_WITH_MATCHING_SLURM_VERSION"
+  ubuntuVersion: "24.04"
+  nodes:
+    - name: control-plane
+      instanceType: cd-gp-a192-genoa
+      count: 2
+      controlPlane: true
+    - name: gpu
+      instanceType: gd-8xh100ib-i128
+      count: 1
+      controlPlane: false
+  storage:
+    homeDir:
+      path: /mnt/home
+      size: 2Ti
+  login:
+    groups:
+      - name: slurm-users
+        userPods: true
+        groupPod: false
+# Login Pods remain internal. Use the documented SSH port-forward path, or
+# configure login.userPods.access for a public load balancer if required.
