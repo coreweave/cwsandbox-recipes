@@ -9,6 +9,7 @@ Sandboxes are isolated compute environments with serverless and CoreWeave Kubern
 | Recipe | What it shows | Hardware |
 |---|---|---|
 | [`claude-code-cloud`](recipes/claude-code-cloud/) | Run Claude Code web sessions in on-demand worker sandboxes, with a sandbox-hosted orchestrator. | CPU only |
+| [`browser-use`](recipes/browser-use/) | Run browser agents with W&B Serverless Inference, verify results, and collect artifacts from parallel CPU sandboxes. | CPU only |
 | [`tailcat`](recipes/tailcat/) | Connect Serverless Sandboxes to a private CKS Service with Tailcat, including reverse connections and a round trip. | CPU only |
 | [`github-actions`](recipes/github-actions/) | Run public repository tests in disposable sandboxes from GitHub Actions, with optional advisory AI review. | CPU only |
 | [`deepswe`](recipes/deepswe/) | Evaluate a coding agent on DeepSWE v1.1 with separate task and verifier sandboxes. | CPU only |
