@@ -6,6 +6,7 @@ sunk/native_grpo.py. Generation uses the current in-memory policy every step.
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -85,6 +86,9 @@ def main():
                     temperature=1.0,
                     top_p=1.0,
                     top_k=0,
+                    # Match raw policy logprobs and the EOS used by token_mask.
+                    repetition_penalty=1.0,
+                    eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
             prompt_length = inputs["input_ids"].shape[1]
@@ -131,7 +135,11 @@ def main():
             )
             loss.backward()
             grad_norm = float(torch.nn.utils.clip_grad_norm_(params, 1.0))
-            if not torch.isfinite(loss) or grad_norm == 0:
+            if (
+                not torch.isfinite(loss)
+                or not math.isfinite(grad_norm)
+                or grad_norm <= 0
+            ):
                 raise RuntimeError(
                     "No finite, nonzero policy gradient; increase rollout diversity"
                 )

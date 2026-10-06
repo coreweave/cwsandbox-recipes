@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -33,10 +34,16 @@ def main():
     model = PeftModel.from_pretrained(model, adapter).eval()
     with torch.no_grad():
         adapted = model(**inputs).logits.float()
+    if not torch.isfinite(baseline).all() or not torch.isfinite(adapted).all():
+        raise RuntimeError("Checkpoint reload produced non-finite logits")
     delta = float((baseline - adapted).abs().max())
-    if not delta > 0:
+    if not math.isfinite(delta) or delta <= 0:
         raise RuntimeError("Reloaded checkpoint did not change model logits")
     tensors = load_file(str(adapter / "adapter_model.safetensors"))
+    if not tensors or any(
+        not torch.isfinite(value).all() for value in tensors.values()
+    ):
+        raise RuntimeError("Checkpoint adapter tensors are empty or non-finite")
     evidence = {
         "checkpoint_reload_passed": True,
         "max_logit_delta_vs_base": delta,

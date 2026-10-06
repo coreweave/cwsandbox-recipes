@@ -15,7 +15,6 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_response_dataset
 from nemo_rl.data.interfaces import TaskDataSpec
 from nemo_rl.data.processors import math_hf_data_processor
-from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.environments.interfaces import EnvironmentInterface, EnvironmentReturn
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
@@ -96,7 +95,17 @@ def main():
 
     # Keep the credential out of Ray's environment metadata for GPU workers.
     api_key = os.environ.pop("CWSANDBOX_API_KEY")
-    init_ray()
+    # Always create a job-owned cluster inside this single-node allocation.
+    runtime_env = dict(os.environ)
+    runtime_env.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+    runtime_env.pop("RAY_ADDRESS", None)
+    ray.init(
+        address="local",
+        log_to_driver=True,
+        include_dashboard=False,
+        runtime_env={"env_vars": runtime_env},
+        num_cpus=int(os.environ.get("SLURM_CPUS_PER_TASK", "16")),
+    )
     tokenizer = get_tokenizer(config["policy"]["tokenizer"])
     config["policy"]["generation"] = configure_generation_config(
         config["policy"]["generation"], tokenizer
