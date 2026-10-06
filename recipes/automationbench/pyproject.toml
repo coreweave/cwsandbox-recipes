@@ -1,0 +1,14 @@
+[project]
+name = "automationbench-cwsandbox"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["harbor @ git+https://github.com/harbor-framework/harbor.git@0dc28dd8051947ef019b6506357fc8fdb72f0be4", "cwsandbox==1.17.0"]
+
+[tool.uv.workspace]
+members = []
+
+[dependency-groups]
+dev = ["ruff==0.16.9"]
+
+[tool.uv]
+package = false
