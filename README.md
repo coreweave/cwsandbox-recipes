@@ -8,17 +8,21 @@ Sandboxes are isolated compute environments with serverless and CoreWeave Kubern
 
 | Recipe | What it shows | Hardware |
 |---|---|---|
+| [`claude-code-cloud`](recipes/claude-code-cloud/) | Run Claude Code web sessions in on-demand worker sandboxes, with a sandbox-hosted orchestrator. | CPU only |
+| [`browser-use`](recipes/browser-use/) | Run browser agents with W&B Serverless Inference, verify results, and collect artifacts from parallel CPU sandboxes. | CPU only |
 | [`tailcat`](recipes/tailcat/) | Connect Serverless Sandboxes to a private CKS Service with Tailcat, including reverse connections and a round trip. | CPU only |
 | [`github-actions`](recipes/github-actions/) | Run public repository tests in disposable sandboxes from GitHub Actions, with optional advisory AI review. | CPU only |
 | [`nemo-rl`](recipes/nemo-rl/) | NeMo RL post-training with CPU sandbox rewards on GPU sandboxes or SUNK, plus Serverless Inference model-support requirements. | GPU + CPU sandbox |
+| [`deepswe`](recipes/deepswe/) | Evaluate a coding agent on DeepSWE v1.1 with separate task and verifier sandboxes. | CPU only |
 | [`warm-pool`](recipes/warm-pool/) | Reduce startup latency for concurrent workloads with ready sandboxes and automatic replenishment. Includes a live comparison, isolation checks, and snapshot guidance. | CPU only |
 | [`openai-agents-api`](recipes/openai-agents-api/) | Investigate synthetic inference telemetry with an OpenAI Agent coordinator and three subagents; verify metrics, delegation, turn overlap, and cleanup. | CPU only |
+| [`automationbench`](recipes/automationbench/) | Evaluate configurable models with AutomationBench, Harbor task scheduling, bounded retries, and CPU sandbox cleanup. | CPU only |
 | [`taubench-verl`](recipes/taubench-verl/) | RL training (GRPO) of a tool-using agent on tau-bench with veRL. GPU sandbox or optional SkyPilot/CKS trainer; per-worker CPU sandbox pools, serverless by default. W&B Models metrics, optional Weave traces, and checkpoint reference artifacts. | 8x H100 + CPU pools |
 
 ## Getting started
 
 1. Pick a recipe and open its README.
-2. Copy its `.env.example` to `.env` and fill it in. Every variable is documented inline.
+2. Configure credentials as described in the recipe's README. Its `.env.example` documents each variable.
 3. Follow the recipe's run steps.
 
 Each recipe is self-contained: its own dependency declarations, config, and tests. Follow its installation steps and configure credentials and placement before running it.
