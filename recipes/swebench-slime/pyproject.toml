@@ -1,0 +1,43 @@
+[project]
+name = "cwsandbox-swebench-slime-recipe"
+version = "0.1.0"
+description = "slime coding-agent RL rollouts and grading on CoreWeave Sandboxes, plus a GPU trainer smoke test."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "cwsandbox==1.18.0",
+    # slime's SWE grader imports the 4.x module layout (swebench.harness.test_spec.test_spec).
+    "swebench==4.1.0",
+    # Imported by slime's agent rollout code at module load; nothing here runs a model.
+    "torch==2.9.1",
+    "numpy>=1.26",
+    "aiohttp>=3.10",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "packaging>=24.0",
+    "pillow>=10.0",
+]
+
+[dependency-groups]
+dev = ["pytest==8.4.2", "ruff==0.12.12"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
