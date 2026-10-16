@@ -1,0 +1,3 @@
+# Installed by run_gym.build_server_venv (from outside the Gym tree, plus cryptography).
+-e nemo-gym[dev] @ /opt/gym
+cwsandbox==1.19.0

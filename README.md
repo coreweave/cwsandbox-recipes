@@ -15,6 +15,7 @@ Sandboxes are isolated compute environments with serverless and CoreWeave Kubern
 | [`deepswe`](recipes/deepswe/) | Evaluate a coding agent on DeepSWE v1.1 with separate task and verifier sandboxes. | CPU only |
 | [`warm-pool`](recipes/warm-pool/) | Reduce startup latency for concurrent workloads with ready sandboxes and automatic replenishment. Includes a live comparison, isolation checks, and snapshot guidance. | CPU only |
 | [`openai-agents-api`](recipes/openai-agents-api/) | Investigate synthetic inference telemetry with an OpenAI Agent coordinator and three subagents; verify metrics, delegation, turn overlap, and cleanup. | CPU only |
+| [`dapo-nemo-rl`](recipes/dapo-nemo-rl/) | DAPO RL on Qwen2.5-Math-7B: NeMo-RL v0.7.0 on one SUNK node, rollouts from a CoreWeave Dedicated Inference deployment that gets new weights by hot-load, NeMo-Gym v0.6.0 in a CPU sandbox that grades evaluation and calibration in more CPU sandboxes. | SUNK 8x H100 node; 2 x H100 inference; CPU sandboxes |
 | [`taubench-verl`](recipes/taubench-verl/) | RL training (GRPO) of a tool-using agent on tau-bench with veRL. GPU sandbox or optional SkyPilot/CKS trainer; per-worker CPU sandbox pools, serverless by default. W&B Models metrics, optional Weave traces, and checkpoint reference artifacts. | 8x H100 + CPU pools |
 
 ## Getting started

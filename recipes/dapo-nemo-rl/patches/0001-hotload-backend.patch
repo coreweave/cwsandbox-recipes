@@ -1,0 +1,130 @@
+dapo-nemo-rl patch for NeMo-RL (https://github.com/NVIDIA-NeMo/RL), base tag v0.7.0.
+Adds the coreweave_hotload generation backend: a policy-only Ray cluster, the recipe's hot-load
+weight synchronizer as the refit path, and GPU accounting for an external deployment.
+Applied by dapo_nemo_rl/run_trainer.py with `git apply`, which skips this header.
+Upstream code: Apache-2.0, NVIDIA CORPORATION.
+
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index 76d75c8..8987245 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -564,7 +564,33 @@ def setup(
+             flush=True,
+         )
+ 
+-    if colocated_inference:
++    if generation_config["backend"] == "coreweave_hotload":
++        # A Dedicated Inference deployment serves rollouts and receives weights by hot-load,
++        # so this cluster holds only the policy: no inference cluster, no NCCL group.
++        policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
++        assert policy_gpus_per_node > 0, (
++            "cluster.gpus_per_node must leave GPUs for the policy with the "
++            f"coreweave_hotload backend, but got {policy_gpus_per_node}."
++        )
++        train_cluster = RayVirtualCluster(
++            name="grpo_policy_cluster",
++            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
++            use_gpus=True,
++            num_gpus_per_node=policy_gpus_per_node,
++            max_colocated_worker_groups=1,
++            port_range_low=cluster_config.get("master_port_range_low"),
++            port_range_high=cluster_config.get("master_port_range_high"),
++        )
++        inference_cluster = None
++        inference_nodes = 0
++        inference_gpus_per_node = 0
++        print(
++            f"  ✓ Ray cluster for policy initialized with {policy_nodes} nodes; "
++            "rollouts come from the Dedicated Inference deployment",
++            flush=True,
++        )
++
++    elif colocated_inference:
+         if total_nodes == 1:
+             policy_gpus_per_node = cluster_config["gpus_per_node"] - rm_gpus_per_node
+             assert policy_gpus_per_node > 0, (
+@@ -1126,6 +1152,42 @@ def setup(
+             flush=True,
+         )
+ 
++    elif backend == "coreweave_hotload":
++        # The recipe's package provides the backend; NeMo-RL's registries are hardcoded.
++        from dapo_nemo_rl.nemo_rl_ext import (
++            HotLoadGeneration,
++            HotLoadWeightSynchronizer,
++            register_worker_extension,
++        )
++
++        worker_extension = register_worker_extension(policy_config)
++        t0 = time.perf_counter()
++        policy = _make_policy(
++            cluster=train_cluster,
++            config=policy_config,
++            tokenizer=tokenizer,
++            processor=processor,
++            weights_path=weights_path,
++            optimizer_path=optimizer_path,
++            init_optimizer=True,
++            init_reference_model=init_reference_model,
++            worker_extension_cls_fqn=worker_extension,
++        )
++        worker_init_timing_metrics["policy_init_time_s"] = time.perf_counter() - t0
++        policy_generation = HotLoadGeneration(generation_config)
++        policy_generation.weight_synchronizer = HotLoadWeightSynchronizer(
++            policy, policy_generation, hf_checkpoint=policy_config["model_name"]
++        )
++        if enable_nemo_gym:
++            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
++                [policy_generation.base_url], generation_config["model_name"]
++            )
++            worker_init_timing_metrics["nemo_gym_init_time_s"] = nemo_gym_time
++        print(
++            f"  ✓ Using the Dedicated Inference deployment at {policy_generation.base_url} for generation",
++            flush=True,
++        )
++
+     # Record when worker initialization completes (for calculating other setup time)
+     worker_init_complete_time = time.perf_counter() - setup_start_time
+ 
+@@ -1133,7 +1195,7 @@ def setup(
+     policy.print_node_ip_and_gpu_id()
+ 
+     # if it is not colocated inference, initialize collective communication for update weights
+-    if not colocated_inference:
++    if not colocated_inference and backend != "coreweave_hotload":
+         t0 = time.perf_counter()
+         ip, port = train_cluster.get_master_address_and_port()
+         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
+@@ -1868,6 +1930,12 @@ def refit_policy_generation(
+         timer: Optional Timer used to time the prepare/transfer/update phase
+         kv_scales: Optional dictionary of KV cache scales for FP8 quantization.
+     """
++    # A generation backend with its own weight synchronizer owns the whole transfer.
++    synchronizer = getattr(policy_generation, "weight_synchronizer", None)
++    if synchronizer is not None:
++        synchronizer.sync_weights(timer=timer, kv_scales=kv_scales)
++        return
++
+     # Megatron generation backend needs explicit suspend/resume around refits.
+     if isinstance(policy_generation, MegatronGeneration):
+         policy_generation.suspend_for_refit()
+diff --git a/nemo_rl/algorithms/utils.py b/nemo_rl/algorithms/utils.py
+index 1aaaa45..a0af0b0 100644
+--- a/nemo_rl/algorithms/utils.py
++++ b/nemo_rl/algorithms/utils.py
+@@ -770,7 +770,14 @@ def print_performance_metrics(
+         "num_prompts_per_step", 1
+     ) * algo_config.get("num_generations_per_prompt", 1)
+ 
+-    if colocated_inference:
++    if master_config.policy["generation"]["backend"] == "coreweave_hotload":
++        # Generation runs on the deployment; none of its GPUs are in this cluster.
++        training_num_gpus = total_num_gpus
++        generation_num_gpus = (
++            master_config.policy["generation"]["colocated"]["resources"]["gpus_per_node"]
++            or 1
++        )
++    elif colocated_inference:
+         training_num_gpus = total_num_gpus
+         generation_num_gpus = total_num_gpus
+     else:

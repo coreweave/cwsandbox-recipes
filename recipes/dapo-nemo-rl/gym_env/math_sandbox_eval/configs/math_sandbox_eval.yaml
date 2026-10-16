@@ -1,0 +1,24 @@
+# Evaluation environment: grades math answers in CoreWeave sandboxes.
+# run_gym.py sets the host, the ports and the runner.
+math_sandbox_eval:
+  resources_servers:
+    math_sandbox_eval:
+      entrypoint: app.py
+      sandbox:
+        cwsandbox:
+          runner_id: ${oc.env:CWSANDBOX_RUNNER_ID}
+          tags: [dapo-nemo-rl, "${oc.env:DAPO_RUN_TAG}"]
+      pool_size: 4
+      domain: math
+      verified: false
+      description: Math-verify grading in CoreWeave sandboxes, for evaluation
+math_eval_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: math_sandbox_eval
+      model_server:
+        type: responses_api_models
+        name: policy_model
