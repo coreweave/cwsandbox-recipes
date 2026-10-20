@@ -175,3 +175,16 @@ sh -n bootstrap.sh sandbox-k3s
 ```
 
 Sources: [K3s backup and restore](https://docs.k3s.io/datastore/backup-restore), [K3s Tailscale integration](https://docs.k3s.io/networking/distributed-multicloud), [Tailcat](https://github.com/tailscale/tailcat/tree/v0.7.0), [Headscale](https://headscale.net/), and the adjacent [`tailcat` recipe](../tailcat/).
+
+## Development sizing and version
+
+The default shared deadline remains one hour. For a larger disposable dev
+environment, `up --lifetime-seconds 14400 --disk-gib 80` allows up to four hours
+and configures an 80 GiB sparse ext4 backing file on each node. Workers inherit
+the remaining deadline and disk size. Disk allocation is still ephemeral and
+limited by the enclosing sandbox's available storage; this is not a persistent
+volume or a storage reservation. The platform enforces the deadline.
+
+Pin another Kubernetes version with `--k3s-version v1.35.1-k3s1`. The chosen
+image is saved with the cluster and reused for new workers and restoration.
+This does not upgrade or downgrade an existing cluster.

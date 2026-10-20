@@ -217,7 +217,7 @@ def restore(args, api):
         )
         api.wait_command(sb, "curl -fsS http://127.0.0.1:8080/health")
     started = time.time()
-    api.execute(server, api.node_command(node))
+    api.execute(server, api.node_command(node, image=state.get("k3s_image", api.K3S_IMAGE)))
     api.wait_node(server, "k3s-server")
     for name in state["workers"]:
         api.wait_node(server, name)

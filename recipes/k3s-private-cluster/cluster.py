@@ -101,6 +101,10 @@ def new_sandbox(state, name, cpu, memory, snapshot_id=None):
         placement_spillover="strict",
         resources=ResourceOptions(limits={"cpu": cpu, "memory": memory}),
         security_context=SecurityContext(privileged=True),
+        environment_variables={
+            "K3S_DISK_GIB": str(state.get("disk_gib", 12)),
+            "K3S_IMAGE": state.get("k3s_image", K3S_IMAGE),
+        },
         mounted_files=[
             {
                 "mount_path": "/bootstrap.sh",
@@ -209,7 +213,7 @@ def connect_network(state, node, sb, server):
     print(f"{node['name']}: private address {node['ip']}", flush=True)
 
 
-def node_command(node, server_ip=None):
+def node_command(node, server_ip=None, image=K3S_IMAGE):
     # 'host' here is the enclosing Kata guest, never the physical Kubernetes node.
     args = [
         "docker",
@@ -233,7 +237,7 @@ def node_command(node, server_ip=None):
     ]:
         args += ["-v", mount]
     args += [
-        K3S_IMAGE,
+        image,
         "agent" if server_ip else "server",
         "--node-name",
         node["name"],
@@ -280,7 +284,11 @@ def add_worker(state, cpu, memory):
         "> /demo/node-token; chmod 600 /demo/node-token",
     )
     sb.write_file("/demo/node-token", server.read_file("/demo/node-token").result()).result()
-    execute(sb, "chmod 600 /demo/node-token; " + node_command(node, state["server"]["ip"]))
+    execute(
+        sb,
+        "chmod 600 /demo/node-token; "
+        + node_command(node, state["server"]["ip"], state.get("k3s_image", K3S_IMAGE)),
+    )
     wait_node(server, name)
     node["ready"] = True
     save(state)
@@ -328,7 +336,9 @@ def up(args):
         raise RuntimeError("Cluster state exists; use scale, or down before creating another.")
     state = {
         "tag": "k3s-demo-" + uuid.uuid4().hex[:12],
-        "expires_at": time.time() + 3600,
+        "expires_at": time.time() + args.lifetime_seconds,
+        "disk_gib": args.disk_gib,
+        "k3s_image": "rancher/k3s:" + args.k3s_version,
         "workers": {},
         "removed": [],
         "next_worker": 1,
@@ -337,7 +347,7 @@ def up(args):
     server, node = new_sandbox(state, "k3s-server", args.server_cpu, args.server_memory)
     setup_coordinator(server)
     connect_network(state, node, server, server)
-    execute(server, node_command(node))
+    execute(server, node_command(node, image=state["k3s_image"]))
     wait_node(server, "k3s-server")
     print("K3s control plane ready. Adding workers...", flush=True)
     for _ in range(args.workers):
@@ -577,6 +587,12 @@ def worker_count(value):
     return count
 
 
+def k3s_version(value):
+    if not re.fullmatch(r"v\d+\.\d+\.\d+-k3s\d+", value):
+        raise argparse.ArgumentTypeError("Expected a pinned version such as v1.35.1-k3s1")
+    return value
+
+
 def main():
     global STATE
     os.umask(0o077)
@@ -591,6 +607,23 @@ def main():
     )
     launch.add_argument("--server-cpu", type=cpu_quantity, default="4")
     launch.add_argument("--server-memory", type=memory_quantity, default="8Gi")
+    launch.add_argument("--k3s-version", type=k3s_version, default=K3S_IMAGE.split(":")[1])
+    launch.add_argument(
+        "--lifetime-seconds",
+        type=int,
+        choices=range(600, 14401),
+        default=3600,
+        metavar="600..14400",
+        help="Shared cluster deadline (default: 1 hour)",
+    )
+    launch.add_argument(
+        "--disk-gib",
+        type=int,
+        choices=range(12, 129),
+        default=12,
+        metavar="12..128",
+        help="Sparse ext4 disk size per node",
+    )
     resize = sub.add_parser("scale")
     resize.add_argument("--workers", type=worker_count, required=True)
     resize.add_argument("--cpu", type=cpu_quantity, default="2", help="CPU for new workers only")

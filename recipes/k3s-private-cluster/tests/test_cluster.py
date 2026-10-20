@@ -33,6 +33,19 @@ def test_node_command_uses_secret_files_and_guest_network():
     assert "joinKey=" not in command
 
 
+def test_node_command_can_pin_a_compatible_kubernetes_version():
+    image = "rancher/k3s:v1.35.1-k3s1"
+    command = cluster.node_command({"name": "k3s-server", "ip": "100.64.0.1"}, image=image)
+    assert image in command
+    assert cluster.K3S_IMAGE not in command
+
+
+@pytest.mark.parametrize("value", ["latest", "v1.35.1-k3s1; echo bad", "other/image:v1"])
+def test_k3s_version_rejects_unpinned_or_arbitrary_images(value):
+    with pytest.raises(argparse.ArgumentTypeError):
+        cluster.k3s_version(value)
+
+
 def test_readiness_requires_exact_nodes_and_ready_conditions():
     node = {
         "metadata": {"name": "one"},
