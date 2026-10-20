@@ -30,6 +30,8 @@ from typing import Any, Optional
 import weave
 from coreweave.forge.agentlens import tracing
 from coreweave.forge.agentlens.tracing import LLM, Message, Tool, Usage
+from opentelemetry import trace as otel_trace
+from opentelemetry.sdk.trace import TracerProvider
 
 FORGE_URL = "https://forge.coreweave.com/wandb"
 AGENT_NAME = "math-tir-agent"
@@ -159,6 +161,10 @@ class Forge:
         self.rounds = 0
         self.lock = threading.Lock()  # the server adds rows from worker threads
         tracing.init(self.project, autopatch_integrations=False)
+        # weave.init installs a global OpenTelemetry provider that exports to Agent Lens unless one
+        # is set, and Gym's FastAPI servers emit a span per request. An exporter-less provider
+        # drops those; the episode traces use Forge's own provider.
+        otel_trace.set_tracer_provider(TracerProvider())
         weave.init(self.project)
         print(f"[forge] traces: {FORGE_URL}/{self.project}/weave/agents", flush=True)
 

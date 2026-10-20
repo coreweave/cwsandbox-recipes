@@ -271,7 +271,7 @@ const PART_OF_PHASE = { export: "sync", hotload: "sync", generation: "gen", rewa
 const S = {
   meta: {}, t0: null, stages: {}, step: 0, of: 0, phase: null, phases: [], gpu: [], sampler: [], env: [], sbx: [],
   steps: [], accuracy: [], hotloads: [], lastSampler: null, lastEnv: null, ended: false, deploy: [],
-  stepStart: {}, bgHotloads: {}, examples: [], examplesShown: null,
+  stepStart: {}, bgHotloads: {}, examples: [], examplesShown: null, clockOffset: null,
 };
 
 // ---------------------------------------------------------------- events
@@ -309,12 +309,43 @@ function setPhase(phase, t, step) {
   S.phase = { phase, t0: t, t1: null, step };
   S.phases.push(S.phase);
 }
+// A finished step's phases, rebuilt from NeMo-RL's own timings and placed so the export ends when
+// the next weights version starts its hot-load (on the trainer's clock). The step in progress, and
+// recordings without these events, use the phases as the log lines arrived.
+function trainerPhases() {
+  const rebuilt = [], done = new Set();
+  let prevEnd = null;
+  for (const d of S.steps) {
+    const t = d.timings || {}, end = (S.bgHotloads[d.step + 1] || {}).start;
+    if (!end || t.weight_sync === undefined) continue;
+    let x = end;
+    const back = (phase, dur) => { if (dur > 0) { rebuilt.push({ phase, t0: x - dur, t1: x, step: d.step }); x -= dur; } };
+    back("export", t.weight_sync);
+    back("training", (t.policy_training || 0) + (t.training_prep || 0));
+    back("logprobs", (t.policy_and_reference_logprobs || 0) + (t.logprob_inference_prep || 0));
+    back("generation", t.exposed_generation || 0);
+    if (t.validation) rebuilt.push({ phase: "validation", t0: end, t1: end + t.validation, step: d.step });
+    // NeMo-RL's step_time leaves out about 30 s per step between one step's weight sync and the next step
+    if (prevEnd !== null && x - prevEnd > 2) rebuilt.push({ phase: "between", t0: prevEnd, t1: x, step: d.step });
+    prevEnd = end + (t.validation || 0);
+    S.stepStart[d.step] = x;
+    done.add(d.step);
+  }
+  return [...rebuilt, ...S.phases.filter((p) => !done.has(p.step))];
+}
 function closePhase(t) { if (S.phase && S.phase.t1 === null) S.phase.t1 = t; }
 const clampDt = (dt) => Math.min(Math.max(dt, 1), 3);
+// The trainer's log reaches this page in bursts, up to about 30 s late. Its rows carry the trainer's
+// own clock (ts); the page's own sandbox poll gives the offset from that clock to this page's.
+function trainerTime(e) {
+  if (!Number.isFinite(e.ts) || S.clockOffset === null) return e.t;
+  return Math.min(e.ts + S.clockOffset, e.t);
+}
 function onMetric(e) {
+  if (e.k === "sandboxes" && Number.isFinite(e.ts)) S.clockOffset = e.t - e.ts;
   if (e.k === "gpu") {
     const util = e.util || [];
-    S.gpu.push({ t: e.t, avg: util.reduce((a, b) => a + b, 0) / Math.max(util.length, 1), util });
+    S.gpu.push({ t: trainerTime(e), avg: util.reduce((a, b) => a + b, 0) / Math.max(util.length, 1), util });
   } else if (e.k === "sampler") {
     const p = S.lastSampler;
     const rate = p ? Math.max(e.gen_tokens - p.gen_tokens, 0) / clampDt(e.ts - p.ts) : 0;
@@ -333,7 +364,7 @@ function onMetric(e) {
     S.deploy.push({ t: e.t, gpus: e.gpus, ready: e.ready });
   } else if (e.k === "hotload") {  // a hot-load that runs in the background while the trainer goes on
     const h = S.bgHotloads[e.version] || (S.bgHotloads[e.version] = { version: e.version });
-    h[e.state] = e.t;
+    h[e.state] = trainerTime(e);
   } else if (e.k === "example") {
     S.examples.push({ ...e, step: S.step });
   }
@@ -373,7 +404,7 @@ function timeChart(canvas, opts) {
   if (!opts.max) for (const s of opts.series) for (const r of s.rows) if (r.t >= t0) max = Math.max(max, s.val(r));
   max = opts.max || niceMax(max * 1.1 || 1);
   const Y = (v) => h - padB - (v / max) * (h - padT - padB);
-  if (opts.bands) for (const b of S.phases) {
+  if (opts.bands) for (const b of trainerPhases()) {
     const a = Math.max(X(b.t0), padL), z = Math.min(X(b.t1 || t1), w - padR);
     if (z <= padL || a >= w - padR) continue;
     ctx.fillStyle = (PHASE_COLOR[b.phase] || "#333") + "26";
@@ -528,7 +559,8 @@ function stepTimeline(canvas) {
 // the rollouts for the next steps keep going while the trainer trains, so the lanes overlap.
 const LANE_WINDOW_S = 720;
 const TRAINER_STYLE = { training: [BLUE3, "train"], logprobs: [BLUE2, "logprobs"], export: [WHITE, "export"], hotload: [WHITE, "hot-load"],
-  validation: [AMBER, "validate"], generation: ["#262b3a", "waiting"], rewards: ["#262b3a", "waiting"] };
+  validation: [AMBER, "validate"], generation: ["#262b3a", "waiting"], rewards: ["#262b3a", "waiting"],
+  between: ["#3a3f4e", "between steps"] };
 const VERSION_COLOR = [BLUE, "#7fb0ff"];
 // when each weights version went live on the sampler
 function liveVersions() {
@@ -540,7 +572,7 @@ function liveVersions() {
 // weights on their way to the sampler: the export (the trainer waits for it), then the upload and
 // hot-load, from the background hot-load's own events when the run has them
 function weightSegments() {
-  const segs = S.phases.filter((p) => p.phase === "export").map((p) => ({ t0: p.t0, t1: p.t1, label: "export", v: p.step + 1 }));
+  const segs = trainerPhases().filter((p) => p.phase === "export").map((p) => ({ t0: p.t0, t1: p.t1, label: "export", v: p.step + 1 }));
   const bg = Object.values(S.bgHotloads).filter((h) => h.start);
   if (bg.length) for (const h of bg) segs.push({ t0: h.start, t1: h.done || null, label: "hot-load", v: h.version });
   else for (const p of S.phases) if (p.phase === "hotload") segs.push({ t0: p.t0, t1: p.t1, label: "hot-load", v: p.step + 1 });
@@ -564,7 +596,7 @@ function lanePoints(rows, val, t0, t1) {
 function overlapShare() {
   const rows = S.sampler;
   let busy = 0, total = 0, i = 0;
-  for (const p of S.phases) {
+  for (const p of trainerPhases()) {
     if (p.phase !== "training" && p.phase !== "logprobs") continue;
     for (let t = p.t0; t < (p.t1 || now()); t += 1) {
       while (i + 1 < rows.length && rows[i + 1].t <= t) i++;
@@ -631,11 +663,11 @@ function laneTimeline(canvas) {
     const text = [`${label} ${Math.round(z - a)}s`, label].find((t) => ctx.measureText(t).width + 10 < x1 - x0);
     if (text) { ctx.fillStyle = dim ? "#8b91a3" : "#000"; ctx.fillText(text, x0 + 5, lane.y + lane.h / 2 + 0.5); }
   };
-  for (const p of S.phases) {
+  for (const p of trainerPhases()) {
     const style = TRAINER_STYLE[p.phase]; if (!style) continue;
     const end = p.t1 || (S.ended ? S.endT : now());
     if (end < t0 || p.t0 > t1) continue;
-    seg(trainer, p.t0, end, style[0], style[1], style[0] === "#262b3a");
+    seg(trainer, p.t0, end, style[0], style[1], style[0] === "#262b3a" || p.phase === "between");
   }
   for (const s of weightSegments()) {
     const end = s.t1 || (S.ended ? S.endT : now());
@@ -733,7 +765,7 @@ function mmss(s) { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600
 
 function renderCards() {
   const phase = S.ended ? null : S.phase && S.phase.phase;
-  const gpu = recent(S.gpu, 8), samp = recent(S.sampler, 3), env = recent(S.env, 3), sbx = S.sbx[S.sbx.length - 1];
+  const gpu = recent(S.gpu, 45), samp = recent(S.sampler, 3), env = recent(S.env, 3), sbx = S.sbx[S.sbx.length - 1];
   // trainer
   const tActive = ["export", "logprobs", "training", "validation", "rewards"].includes(phase) || (gpu && gpu.avg > 20);
   $("cardTrainer").classList.toggle("on", !!tActive);
@@ -838,7 +870,7 @@ function exampleCard(e) {
   const turns = (e.turns || []).map((t) => {
     let html = t.text ? `<div class="say${t.text.length < 300 ? " short" : ""}">${esc(t.text)}</div>` : "";
     if (t.code !== undefined) {
-      html += `<div><div class="k">ran in ${e.sandbox ? `sandbox <b title="${esc(e.sandbox)}">${esc(e.sandbox.slice(0, 8))}</b>` : "its sandbox"} as <b>${esc(t.cell)}</b></div><pre class="code">${esc(t.code)}</pre></div>`;
+      html += `<div><div class="k">ran in ${e.sandbox && !e.sandbox.startsWith("<") ? `sandbox <b title="${esc(e.sandbox)}">${esc(e.sandbox.slice(0, 8))}</b>` : "its sandbox"} as <b>${esc(t.cell)}</b></div><pre class="code">${esc(t.code)}</pre></div>`;
       if (t.output !== undefined) html += `<div><div class="k">output</div><pre class="out">${esc(t.output.trim() || "(no output)")}</pre></div>`;
     }
     return html;

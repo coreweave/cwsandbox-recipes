@@ -1,7 +1,10 @@
 """The dashboard's log parser: launcher, Gym and NeMo-RL lines become page events."""
 
 import json
+import socket
+import urllib.request
 
+from async_grpo_tool_use.dashboard import server
 from async_grpo_tool_use.dashboard.server import Hub, LineParser
 
 STEP_LOG = """\
@@ -120,3 +123,18 @@ def test_background_hot_load_is_on_the_timeline_but_is_not_a_trainer_phase():
     timeline = [(e["version"], e["state"], e["ts"]) for e in events if e.get("k") == "hotload"]
     assert timeline == [(2, "done", 1700000100.0), (3, "start", 1700000150.0)]
     assert all(e["type"] == "metric" for e in events if e.get("k") == "hotload")
+
+
+def test_the_local_page_moves_to_a_free_port_when_its_port_is_taken():
+    """Another dashboard already on the port must not stop the run after the viewer exists."""
+    taken = socket.socket()
+    taken.bind(("127.0.0.1", 0))
+    taken.listen()
+    port = taken.getsockname()[1]
+    try:
+        url = server.serve(Hub(), {}, port)
+        assert url.startswith("http://localhost:") and not url.endswith(f":{port}")
+        with urllib.request.urlopen(url.replace("localhost", "127.0.0.1") + "/meta", timeout=5) as response:
+            assert response.status == 200
+    finally:
+        taken.close()

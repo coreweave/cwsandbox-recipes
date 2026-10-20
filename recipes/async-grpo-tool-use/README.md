@@ -161,11 +161,21 @@ The W&B key reaches the trainer through the run's secrets file on SUNK and the G
 
 ## Measured timings
 
+One run of `uv run async-grpo --max-num-steps 3` (128 rollouts per step, 2 replicas, a pool of 128 rollout sandboxes, cached image and model):
+
 | Phase | Time |
 |---|---|
-| Dashboard URL printed | about 2 s after the start; the page answers about 4 s after the start |
-| Deployment ready | 3 to 10 minutes |
+| Dashboard URL printed | 1.6 s after the viewer sandbox is requested; the page answers at 4.0 s |
+| Start to step 1 | 8 min 20 s: deployment ready at 5 min 25 s (2 min 30 s after it is requested), verifier check done at 6 min 25 s, first batch of rollouts about 2 min |
+| Steps 1 and 2 | 35 s and 48 s |
+| Step 3, with the AIME-2024 eval | 176 s: generate 61 s, train 11 s, validate 20 s, and 62 s that NeMo-RL does not break down |
+| Weight export, per step | 22 s, on the trainer |
+| Upload and hot-load, per step | 50 to 61 s, in the background (upload 14 s, swap into the replicas 36 to 47 s) |
+| Cleanup after the trainer exits | 4 min 40 s, mostly the deployment delete |
+| Whole run | 18 min 30 s |
 | First image import on SUNK (once) | about 50 minutes |
+
+In a longer run of the same trainer code, steps 2 to 5 took 103 to 106 s each with export 22 s and upload plus hot-load about 70 s in the background, and the trainer's GPUs were training about 78% of each step. At 3 steps the trainer is mostly waiting for rollouts, so short runs show much lower GPU use.
 
 ## Cleanup
 

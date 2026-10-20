@@ -138,17 +138,18 @@ def main(argv: list[str] | None = None) -> int:
         if viewer:
             meta["share_url"] = viewer.url
             print(f"[dashboard] {viewer.url}  (read-only, shareable)", flush=True)
-    hub.publish({"type": "meta", **meta})
-    print(f"[dashboard] {server.serve(hub, meta, args.port)}  (this machine)", flush=True)
-    for link in meta["links"]:
-        print(f"[dashboard] {link['label']}: {link['url']}", flush=True)
-
     stop = threading.Event()
-    threading.Thread(target=server.poll_sandboxes, args=(hub, cwsandbox, launcher.run_tag, stop), daemon=True).start()
-    threading.Thread(target=server.poll_deployment, args=(hub, launcher, config.deployment.gpus_per_replica, stop),
-                     daemon=True).start()  # fmt: skip
     code = 1
+    # From here on the viewer sandbox exists; the finally below stops it whatever fails.
     try:
+        hub.publish({"type": "meta", **meta})
+        print(f"[dashboard] {server.serve(hub, meta, args.port)}  (this machine)", flush=True)
+        for link in meta["links"]:
+            print(f"[dashboard] {link['label']}: {link['url']}", flush=True)
+        threading.Thread(target=server.poll_sandboxes, args=(hub, cwsandbox, launcher.run_tag, stop),
+                         daemon=True).start()  # fmt: skip
+        threading.Thread(target=server.poll_deployment, args=(hub, launcher, config.deployment.gpus_per_replica, stop),
+                         daemon=True).start()  # fmt: skip
         code = launcher.run()
     except Exception:
         traceback.print_exc()

@@ -283,8 +283,12 @@ def make_handler(hub: Hub, meta: dict):
 
 
 def serve(hub: Hub, meta: dict, port: int) -> str:
-    """Serve the page on localhost in the background. Return its URL."""
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(hub, meta))
+    """Serve the page on localhost in the background, on ``port`` or, if it is taken, any free
+    port. Return its URL."""
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(hub, meta))
+    except OSError:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(hub, meta))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return f"http://localhost:{port}"
+    return f"http://localhost:{server.server_address[1]}"
