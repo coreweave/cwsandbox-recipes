@@ -1,0 +1,147 @@
+async-grpo-tool-use patch for NeMo-RL (https://github.com/NVIDIA-NeMo/RL), base tag v0.7.0, after 0001.
+Lets the NemoGym actor post rows to Gym agents started elsewhere
+(env.nemo_gym.remote_agent_urls, by agent name) instead of starting Gym itself.
+Applied by async_grpo_tool_use/run_trainer.py with `git apply`, which skips this header.
+Upstream code: Apache-2.0, NVIDIA CORPORATION.
+
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index 8987245..f5463f5 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -483,6 +483,8 @@ def setup(
+             "invalid_tool_call_patterns", None
+         )
+         thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
++        # A Gym agent started outside NeMo-RL (e.g. in another sandbox).
++        remote_agent_urls = nemo_gym_dict.pop("remote_agent_urls", None)
+         # Pass prebuilt cache + venv dirs through the global config so the gym reuses
+         # image-baked venvs instead of rebuilding them.
+         uv_cache_dir = get_nemo_gym_uv_cache_dir()
+@@ -498,6 +500,7 @@ def setup(
+             thinking_tags=thinking_tags,
+             require_routed_experts=router_replay_enabled(policy_config),
+             initial_global_config_dict=nemo_gym_dict,
++            remote_agent_urls=remote_agent_urls,
+         )
+         nemo_gym_opts = {}
+         if nemo_gym_num_nodes:
+@@ -1767,6 +1770,10 @@ def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
+     if not should_use_nemo_gym:
+         return should_use_nemo_gym
+ 
++    if master_config.policy["generation"]["backend"] == "coreweave_hotload":
++        # Gym runs in its own sandbox and calls the deployment over HTTPS.
++        return True
++
+     # Validate the setup for training with NeMo-Gym
+     assert _should_use_async_rollouts(master_config), (
+         "❌ Error: In order to use NeMo-Gym, you must use a generation backend with `async_engine: true`!"
+diff --git a/nemo_rl/environments/nemo_gym.py b/nemo_rl/environments/nemo_gym.py
+index b3f8dcb..70c007a 100644
+--- a/nemo_rl/environments/nemo_gym.py
++++ b/nemo_rl/environments/nemo_gym.py
+@@ -80,6 +80,10 @@ class NemoGymConfig(TypedDict):
+     require_routed_experts: NotRequired[
+         bool
+     ]  # Require Gym output items to carry R3 routed_experts
++    # Base URLs of Gym agent servers started outside NeMo-RL, by agent name. When set,
++    # each row is posted to {url of row["agent_ref"]["name"]}/run and no Gym servers
++    # start in this actor.
++    remote_agent_urls: NotRequired[dict[str, str] | None]
+ 
+ 
+ def _detect_invalid_tool_call_and_malformed_thinking(
+@@ -156,6 +160,10 @@ class NemoGym(EnvironmentInterface):
+         scheduled onto reserved nodes) and spun up explicitly once the vLLM
+         server URLs are available, overlapping with vLLM model loading.
+         """
++        if self.cfg.get("remote_agent_urls"):
++            self._spinup_remote()
++            return
++
+         self.node_ip = _get_node_ip_local()
+         _gym_port_low = self.cfg.get("port_range_low", DEFAULT_GYM_PORT_RANGE_LOW)
+         _gym_port_high = self.cfg.get("port_range_high", DEFAULT_GYM_PORT_RANGE_HIGH)
+@@ -264,9 +272,13 @@ Depending on your data shape, you may want to change these values."""
+         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
+         while trial < max_attempts:
+             nemo_gym_num_rows = len(nemo_gym_examples)
+-            nemo_gym_result_iterator = self.rch.run_examples(
+-                examples=nemo_gym_examples, head_server_config=self.head_server_config
+-            )
++            if self.cfg.get("remote_agent_urls"):
++                nemo_gym_result_iterator = self._run_remote_examples(nemo_gym_examples)
++            else:
++                nemo_gym_result_iterator = self.rch.run_examples(
++                    examples=nemo_gym_examples,
++                    head_server_config=self.head_server_config,
++                )
+ 
+             nemo_rl_rowidxs = []
+             nemo_rl_results = []
+@@ -457,7 +469,65 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
+             "full_result": nemo_gym_result,
+         }
+ 
++    def _spinup_remote(self) -> None:
++        """Use a Gym agent that runs elsewhere; nothing starts in this actor."""
++        global_config = self.cfg.get("initial_global_config_dict") or {}
++        self.rollout_max_attempts_to_avoid_lp_nan = global_config.get(
++            "rollout_max_attempts_to_avoid_lp_nan", 1
++        )
++        assert self.rollout_max_attempts_to_avoid_lp_nan >= 1, (
++            "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
++        )
++        self._remote_run_urls = {
++            name: url.rstrip("/") + "/run" for name, url in self.cfg["remote_agent_urls"].items()
++        }
++        self._remote_concurrency = int(global_config.get("remote_concurrency", 256))
++        self._remote_attempts = int(global_config.get("remote_attempts", 3))
++        print(f"Using remote NeMo-Gym agents: {self._remote_run_urls}", flush=True)
++
++    def _run_remote_examples(self, examples: list[dict]):
++        """POST each row to the remote agent's /run; yield awaitables of (row, result)."""
++        import asyncio
++
++        import aiohttp
++
++        semaphore = asyncio.Semaphore(self._remote_concurrency)
++        session = aiohttp.ClientSession(
++            timeout=aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=3600),
++            connector=aiohttp.TCPConnector(limit=self._remote_concurrency),
++        )
++
++        async def run_one(row: dict) -> tuple[dict, dict]:
++            async with semaphore:
++                for attempt in range(1, self._remote_attempts + 1):
++                    try:
++                        url = self._remote_run_urls[row["agent_ref"]["name"]]
++                        async with session.post(url, json=row) as resp:
++                            if resp.status < 500 or attempt == self._remote_attempts:
++                                if resp.status >= 400:
++                                    body = await resp.text()
++                                    raise RuntimeError(
++                                        f"Gym agent returned HTTP {resp.status}: {body[:2000]}"
++                                    )
++                                return row, await resp.json(content_type=None)
++                    except aiohttp.ClientConnectionError:
++                        if attempt == self._remote_attempts:
++                            raise
++                    await asyncio.sleep(2**attempt)
++                raise AssertionError("unreachable")
++
++        tasks = [asyncio.ensure_future(run_one(row)) for row in examples]
++
++        async def close_when_done() -> None:
++            await asyncio.gather(*tasks, return_exceptions=True)
++            await session.close()
++
++        asyncio.ensure_future(close_when_done())
++        return asyncio.as_completed(tasks)
++
+     def shutdown(self) -> None:
++        if self.cfg.get("remote_agent_urls"):
++            return
+         self.rh.shutdown()
+ 
+     def step(self, message_log_batch, metadata):

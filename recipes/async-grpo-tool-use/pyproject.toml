@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "async-grpo-tool-use"
+version = "0.1.0"
+description = "Async GRPO with Python tool use on Qwen2.5-Math-7B: NeMo-RL on SUNK, rollouts from CoreWeave Dedicated Inference, one CoreWeave sandbox per rollout."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Apache-2.0" }
+# The host only launches the run. NeMo-RL and NeMo-Gym are installed on SUNK and in the
+# Gym sandbox. cwtrain manages the inference gateway and deployment.
+dependencies = [
+    "cwsandbox==1.19.0",
+    "cwtrain==0.1.0",
+]
+
+[project.scripts]
+async-grpo = "async_grpo_tool_use.run:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+    "safetensors>=0.4.0",
+    "numpy>=1.26.0",
+    "pyyaml>=6.0",
+    # The Gym sandbox installs these from gym_env/math_sandbox_eval/requirements.txt; the
+    # tests import the Forge logging module that uses them.
+    "coreweave==0.1.0b0",
+    "weave==0.53.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["async_grpo_tool_use"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'", "sys_platform == 'darwin'"]

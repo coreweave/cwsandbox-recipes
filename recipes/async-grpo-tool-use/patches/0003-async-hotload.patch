@@ -1,0 +1,69 @@
+async-grpo-tool-use patch for NeMo-RL (https://github.com/NVIDIA-NeMo/RL), base tag v0.7.0, after 0001 and 0002.
+Lets async GRPO (grpo.async_grpo.enabled=true) run with the coreweave_hotload backend: admits the
+backend in async_grpo_train, lets in-flight rollouts continue through a hot-load, and fails the
+job when the async loop or its first refit fails, instead of exiting 0. At the end it waits for
+the hot-loads still running in the background (hotload_cfg.max_versions_behind) and fails on their error.
+Applied by async_grpo_tool_use/run_trainer.py with `git apply`, which skips this header.
+Upstream code: Apache-2.0, NVIDIA CORPORATION.
+
+diff --git a/nemo_rl/algorithms/async_utils/trajectory_collector.py b/nemo_rl/algorithms/async_utils/trajectory_collector.py
+index b15db43..6675d95 100644
+--- a/nemo_rl/algorithms/async_utils/trajectory_collector.py
++++ b/nemo_rl/algorithms/async_utils/trajectory_collector.py
+@@ -486,6 +486,10 @@ class AsyncTrajectoryCollector:
+             is_async_engine = generation_cfg.get("mcore_generation_config", {}).get(
+                 "async_engine", False
+             )
++        elif backend == "coreweave_hotload":
++            # The deployment pauses in-flight requests while a replica swaps weights and
++            # resumes them after, so generations need not drain before a hot-load.
++            is_async_engine = True
+         else:
+             is_async_engine = False
+         in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index f7b8b71..bab7751 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -3439,8 +3439,9 @@ def async_grpo_train(
+     # SGLang async rollouts do not support the async GRPO replay path.
+     generation_config = master_config.policy["generation"]
+     backend = generation_config.get("backend", "") if generation_config else ""
+-    assert backend in ("vllm", "megatron") and _should_use_async_rollouts(
+-        master_config
++    # A coreweave_hotload deployment keeps serving while it hot-loads new weights.
++    assert backend == "coreweave_hotload" or (
++        backend in ("vllm", "megatron") and _should_use_async_rollouts(master_config)
+     ), (
+         "Async GRPO requires an async vLLM or Megatron generation engine. "
+         "Set either policy.generation.vllm_cfg.async_engine=true (vLLM) or "
+@@ -3636,7 +3637,8 @@ def async_grpo_train(
+             import traceback
+ 
+             traceback.print_exc()
+-            return
++            # Fail the job: a run that returns here exits 0 without training.
++            raise
+     else:
+         print("🔄 Preparing policy generation for inference...")
+         try:
+@@ -4401,6 +4403,8 @@ def async_grpo_train(
+         import traceback
+ 
+         traceback.print_exc()
++        # Fail the job (e.g. on a failed hot-load) instead of exiting 0 after cleanup.
++        raise
+ 
+     finally:
+         # Clean up
+@@ -4444,4 +4448,10 @@ def async_grpo_train(
+             except Exception as e:
+                 print(f"Error shutting down policy workers: {e}")
+ 
++        # A hot-load can still be running in the background: wait for it, and fail the
++        # job if it failed.
++        synchronizer = getattr(policy_generation, "weight_synchronizer", None)
++        if synchronizer is not None:
++            synchronizer.shutdown()
++
+         print("Async GRPO training complete!")

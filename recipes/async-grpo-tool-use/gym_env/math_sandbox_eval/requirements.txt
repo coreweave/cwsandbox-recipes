@@ -1,0 +1,6 @@
+# Installed by run_gym.build_server_venv (from outside the Gym tree, plus cryptography).
+-e nemo-gym[dev] @ /opt/gym
+cwsandbox==1.19.0
+# Agent Lens traces and Weave evaluations (forge.py)
+coreweave==0.1.0b0
+weave==0.53.12

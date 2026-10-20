@@ -1,0 +1,143 @@
+# Async GRPO with Python tool use on Qwen2.5-Math-7B with NeMo-RL v0.7.0. Rollouts keep running
+# while the trainer trains and hot-loads weights (in-flight weight updates), and each rollout runs
+# its code in its own CoreWeave sandbox (gym_env/math_sandbox_eval/configs/math_tir_sandbox.yaml).
+# NeMo-RL's async GRPO rejects dynamic sampling, reward scaling and reward shaping, so this is
+# plain GRPO with DAPO's clip-higher. Turning reward scaling off changes nothing here: GRPO
+# normalizes rewards per prompt, and the 0/1 -> -1/+1 map is affine.
+# Settings not listed here come from the base config.
+defaults: "/opt/nemo-rl/examples/configs/grpo_math_1B.yaml"
+
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 20
+  use_leave_one_out_baseline: false
+  use_dynamic_sampling: false
+  batch_multiplier: 1
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+  async_grpo:
+    enabled: true
+    # Train step N uses rollouts tagged with weight version N-1. The deployment serves weights
+    # some versions older than the tag (hotload_cfg.max_versions_behind is unbounded): about 1
+    # while a hot-load is shorter than a step, so a rollout is about 2 versions old, and more
+    # while a hot-load is slow. Raising this value would not remove any waiting; it would let
+    # the collector run further ahead and add staleness.
+    max_trajectory_age_steps: 1
+    # Hot-load while rollouts are in flight; the deployment pauses and resumes them.
+    in_flight_weight_updates: true
+    # Each hot-load resets the prompt cache for new requests; in-flight ones keep theirs.
+    recompute_kv_cache_after_weight_updates: false
+  # Evaluation on AIME-2024 every val_period steps and at the end.
+  max_val_samples: null  # set by NeMo-RL to the eval set size
+  val_period: 10
+  val_at_start: false
+  val_at_end: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28  # DAPO clip-higher
+  token_level_loss: true
+  # Required by async GRPO: corrects for rollouts sampled with older or mixed weights.
+  use_importance_sampling_correction: true
+
+checkpointing:
+  enabled: false
+
+policy:
+  model_name: "/work/models/base"  # downloaded at start
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 128  # num_prompts_per_step x num_generations_per_prompt
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
+  max_total_sequence_length: 3072
+  precision: "bfloat16"
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    enabled: false
+  worker_extension_cls_fqn: "async_grpo_tool_use.nemo_rl_ext.worker.ExportDTensorPolicyWorker"
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 1.0e-6
+      weight_decay: 0.1
+      betas: [0.9, 0.999]
+      eps: 1e-8
+  generation:
+    backend: "coreweave_hotload"
+    max_new_tokens: 2048
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    colocated:
+      enabled: false
+      # GPUs of the deployment (2 replicas x 1 GPU); used only for throughput metrics.
+      resources:
+        gpus_per_node: 2
+        num_nodes: 1
+    # Set by run_trainer from the deployment that the launcher created.
+    hotload_cfg:
+      base_url: ${oc.env:INFERENCE_BASE_URL}  # https://<gateway>/v1
+      model: ${oc.env:INFERENCE_MODEL}
+      deployment_id: ${oc.env:HOTLOAD_DEPLOYMENT_ID}
+      run_id: ${oc.env:RUN_TAG}  # hot-load identities are <run_id>-v000001, ...
+      token_env: COREWEAVE_API_TOKEN
+      max_model_len: ${policy.max_total_sequence_length}
+      # Upload and hot-load while the trainer keeps training, and never wait for them. An export
+      # still waiting for the previous upload is dropped for a newer one. Costs staleness (see
+      # max_trajectory_age_steps); set a number N to wait once the deployment is N versions behind.
+      max_versions_behind: .inf
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "/work/data/train.jsonl"
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/work/data/eval.jsonl"
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    processor: "nemo_gym_data_processor"
+    prompt_file: null
+    system_prompt_file: null
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    # The Gym sandbox's agents, local on this node through the Tailcat tunnel. Rows name their agent.
+    remote_agent_urls:
+      math_tir_agent: ${oc.env:GYM_TRAIN_AGENT_URL}
+      math_eval_agent: ${oc.env:GYM_EVAL_AGENT_URL}
+    # Rollouts in flight at once. Each holds one sandbox.
+    remote_concurrency: ${oc.env:GYM_REMOTE_CONCURRENCY,256}
+
+logger:
+  log_dir: "/work/logs"
+  wandb_enabled: false  # run_trainer enables it when WANDB_API_KEY is set
+  tensorboard_enabled: false
+  monitor_gpus: false
+  wandb:
+    project: ${oc.env:WANDB_PROJECT,async-grpo-tool-use}
+    name: ${oc.env:RUN_TAG}  # also the run id (WANDB_RUN_ID), so the dashboard can link it
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

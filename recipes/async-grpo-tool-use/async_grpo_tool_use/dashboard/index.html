@@ -1,0 +1,920 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Post-training on CoreWeave · live</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #000;
+    --panel: #0a0c11;
+    --panel2: #0f121a;
+    --line: #1b1f2b;
+    --line2: #262b3a;
+    --text: #fff;
+    --muted: #8b91a3;
+    --dim: #545a6b;
+    --blue: #2374ff;
+    --blue2: #5c9bff;
+    --blue3: #a9c8ff;
+    --green: #35d07f;
+    --amber: #ffb547;
+    --red: #ff5a5a;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif; font-variant-numeric: tabular-nums; }
+  body { overflow-x: hidden; }
+  .fold { display: grid; grid-template-rows: auto minmax(0, 0.72fr) minmax(0, 1.1fr) minmax(0, 0.95fr);
+    gap: 14px; padding: 18px 26px 18px; height: 100vh; }
+
+  header { display: flex; align-items: center; gap: 20px; white-space: nowrap; min-width: 0; }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; flex-shrink: 1; }
+  .brand .mark { width: 30px; height: 30px; border-radius: 8px; background: var(--blue);
+    display: grid; place-items: center; font-weight: 800; font-size: 15px; }
+  .brand .title { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
+  .brand .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .brand .title span { color: var(--muted); font-weight: 400; font-size: 18px; letter-spacing: -0.01em; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+    border: 1px solid var(--line2); font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+  .pill.live .dot { background: var(--red); box-shadow: 0 0 0 0 rgba(255, 90, 90, .6); animation: pulse 1.6s infinite; }
+  .pill.replay .dot { background: var(--amber); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(255,90,90,.6); } 70% { box-shadow: 0 0 0 9px rgba(255,90,90,0); } 100% { box-shadow: 0 0 0 0 rgba(255,90,90,0); } }
+  .spacer { flex: 1; }
+  .hstat { text-align: right; }
+  .hstat .k { font-size: 11px; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; font-weight: 600; }
+  .hstat .v { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; }
+  .hstat .v small { color: var(--muted); font-weight: 500; font-size: 15px; }
+  .runtag { font-size: 12px; color: var(--dim); font-weight: 500; }
+  .links { display: grid; grid-template-columns: auto auto; gap: 2px 12px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .links a { color: var(--blue2); text-decoration: none; } .links a:hover { color: #fff; }
+
+  .bringup { font-size: 13px; color: var(--muted); }
+  .bringup b { color: #fff; font-weight: 600; }
+
+  /* architecture */
+  .arch { position: relative; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9%; padding: 34px 0 0; min-height: 0; }
+  .arch svg.flows { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+  .card { position: relative; z-index: 1; background: linear-gradient(180deg, var(--panel2), var(--panel)); border: 1px solid var(--line);
+    border-radius: 18px; padding: 16px 18px 14px; display: flex; flex-direction: column; gap: 10px; min-height: 0; transition: border-color .4s, box-shadow .4s; }
+  .card.on { border-color: rgba(35,116,255,.75); box-shadow: 0 0 0 1px rgba(35,116,255,.25), 0 10px 40px -10px rgba(35,116,255,.45); }
+  .card .top { display: flex; align-items: flex-start; gap: 12px; }
+  .card .icon { width: 38px; height: 38px; border-radius: 10px; background: rgba(35,116,255,.12); display: grid; place-items: center; flex: none; }
+  .card .icon svg { width: 22px; height: 22px; stroke: var(--blue2); fill: none; stroke-width: 1.7; }
+  .card h2 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.01em; }
+  .card .sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .card .state { margin-left: auto; font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--dim);
+    padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line2); white-space: nowrap; }
+  .card .state.on { color: #fff; background: var(--blue); border-color: var(--blue); }
+  .card .state.alt { color: #000; background: #fff; border-color: #fff; }
+  .kpis { display: flex; align-items: flex-end; gap: 22px; }
+  .kpi .v { font-size: 40px; font-weight: 800; letter-spacing: -0.03em; line-height: 1; }
+  .kpi .v small { font-size: 16px; color: var(--muted); font-weight: 600; margin-left: 4px; letter-spacing: 0; }
+  .kpi .k { font-size: 11px; color: var(--muted); letter-spacing: .1em; text-transform: uppercase; font-weight: 600; margin-top: 6px; }
+  .kpi.minor .v { font-size: 22px; font-weight: 700; }
+  .note { margin-top: auto; font-size: 13px; color: var(--muted); line-height: 1.4; min-height: 18px; }
+  .note b { color: #fff; font-weight: 600; }
+  .gpus { display: grid; grid-template-columns: repeat(8, 1fr); gap: 5px; margin-left: auto; width: 46%; height: 46px; align-items: end; }
+  .gpus div { background: var(--line); border-radius: 3px; height: 100%; position: relative; overflow: hidden; }
+  .gpus div b { position: absolute; left: 0; right: 0; bottom: 0; background: var(--blue); transition: height .6s ease; height: 0; }
+  .pool { margin-left: auto; display: grid; grid-template-columns: repeat(16, 1fr); gap: 4px; width: 48%; }
+  .pool div { aspect-ratio: 1; border-radius: 3px; background: var(--line); transition: background .3s; }
+  .pool div.up { background: rgba(35,116,255,.35); }
+  .pool div.busy { background: var(--blue); }
+  .pool div.gym { background: #fff; }
+  .flowlabel { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; fill: var(--dim); }
+  .flowlabel.on { fill: var(--blue3); }
+  .storage { position: absolute; top: 0; left: 50%; transform: translateX(-50%); z-index: 2; display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line2); font-size: 12px; color: var(--muted); white-space: nowrap; transition: all .4s; }
+  .storage.on { color: #000; background: #fff; border-color: #fff; }
+  .storage svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 1.8; }
+
+  /* charts */
+  .charts { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 9%; min-height: 0; }
+  .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px 6px; display: flex; flex-direction: column; min-height: 0; }
+  .chart .h { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: .04em; }
+  .chart .h b { color: var(--text); font-weight: 700; font-size: 13px; letter-spacing: 0; }
+  .chart .h .legend { margin-left: auto; display: flex; gap: 10px; font-weight: 500; }
+  .chart .h .legend span::before { content: ""; display: inline-block; width: 9px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; background: var(--c); }
+  .chart .h .legend span.dash::before { height: 0; border-top: 2px dashed var(--c); background: none; }
+  .chart canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+
+  /* steps */
+  .steps { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; min-height: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 10px 14px; min-height: 0; display: flex; flex-direction: column; }
+  .panel .h { display: flex; align-items: baseline; gap: 12px; font-size: 12px; color: var(--muted); font-weight: 600; margin-bottom: 6px; }
+  .panel .h b { color: var(--text); font-size: 13px; white-space: nowrap; }
+  .panel .h .stat { white-space: nowrap; }
+  .panel .h .stat b { color: var(--green); }
+  .panel .h .legend { margin-left: auto; display: flex; gap: 12px; font-weight: 500; flex-wrap: wrap; }
+  .panel .h .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; background: var(--c); }
+  .panel canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: right; color: var(--dim); font-weight: 600; font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; padding: 3px 6px; }
+  td { text-align: right; padding: 5px 6px; border-top: 1px solid var(--line); color: var(--muted); }
+  td:first-child, th:first-child { text-align: left; }
+  tr:last-child td { color: #fff; }
+  td.up { color: var(--green); }
+  .log { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; line-height: 1.55; margin-top: auto; padding-top: 6px; border-top: 1px solid var(--line); }
+  .log div:last-child { color: var(--muted); }
+  .empty { color: var(--dim); font-size: 13px; padding: 10px 0; }
+
+  /* below the fold */
+  .below { padding: 26px 26px 40px; display: flex; flex-direction: column; gap: 14px; }
+  .below h2 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+  .below .lead { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+  .below .panel.bars { height: 270px; }
+  .examples { display: flex; flex-direction: column; gap: 12px; height: 900px; overflow-y: auto; padding-right: 6px; }
+  .ex { flex: none; background: linear-gradient(180deg, var(--panel2), var(--panel)); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 16px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr); gap: 10px 22px; }
+  .ex .side, .ex .work { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+  .ex .answer { margin-top: auto; }
+  .ex .top { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  .ex .top .when { margin-left: auto; color: var(--dim); }
+  .badge { padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; border: 1px solid var(--line2); color: var(--muted); }
+  .badge.ok { color: #000; background: var(--green); border-color: var(--green); }
+  .badge.bad { color: #fff; background: rgba(255,90,90,.18); border-color: var(--red); }
+  .ex .k { font-size: 10.5px; color: var(--dim); font-weight: 600; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 4px; }
+  .ex .k b { color: var(--blue3); font-weight: 700; letter-spacing: .02em; text-transform: none; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .ex .problem { font-size: 13.5px; line-height: 1.45; color: #fff; white-space: pre-wrap; }
+  .ex .problem .frame { color: var(--dim); font-size: 12px; }
+  .ex .say { font-size: 12.5px; line-height: 1.45; color: var(--muted); white-space: pre-wrap; max-height: 6.5em; overflow: hidden;
+    -webkit-mask-image: linear-gradient(180deg, #000 70%, transparent); mask-image: linear-gradient(180deg, #000 70%, transparent); }
+  .ex .say.short { -webkit-mask-image: none; mask-image: none; }
+  .ex pre { margin: 0; padding: 9px 11px; border-radius: 8px; font: 12px/1.45 ui-monospace, "SF Mono", Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
+  .ex pre.code { background: #05070b; border: 1px solid var(--line2); border-left: 3px solid var(--blue); color: #dfe6f5; max-height: 15em; overflow: auto; }
+  .ex pre.out { background: #05070b; border: 1px solid var(--line); border-left: 3px solid #fff; color: #c9cdd6; max-height: 9em; overflow: auto; }
+  .ex .answer { display: flex; gap: 18px; padding-top: 8px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+  .ex .answer b { color: #fff; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="fold">
+<header>
+  <div class="brand"><div class="mark">CW</div><div class="title">Post-training, live <span id="algo">· Async GRPO with Python tool use on Qwen2.5-Math-7B</span></div></div>
+  <span class="pill" id="mode"><span class="dot"></span><span id="modeText">connecting</span></span>
+  <span class="bringup" id="bringup"></span>
+  <div class="spacer"></div>
+  <span class="runtag" id="runtag"></span>
+  <span class="links" id="links"></span>
+  <div class="hstat"><div class="k">Step</div><div class="v" id="stepV">–<small id="stepOf"></small></div></div>
+  <div class="hstat"><div class="k">Avg reward</div><div class="v" id="rewardV">–</div></div>
+  <div class="hstat"><div class="k">Trainer GPUs training</div><div class="v" id="busyV">–</div></div>
+  <div class="hstat"><div class="k">Sandboxes started</div><div class="v" id="sbxTotalV">–</div></div>
+  <div class="hstat"><div class="k">Elapsed</div><div class="v" id="elapsedV">0:00</div></div>
+</header>
+
+
+<section class="arch" id="arch">
+  <svg class="flows" id="flows"></svg>
+  <div class="storage" id="storage"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+    AI Object Storage · weights <span id="hotloadV"></span></div>
+
+  <div class="card" id="cardTrainer">
+    <div class="top">
+      <div class="icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg></div>
+      <div><h2>Trainer</h2><div class="sub">SUNK · H100 · NeMo-RL</div></div>
+      <div class="state" id="stTrainer">idle</div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="v" id="gpuV">–<small>%</small></div><div class="k">GPU utilization</div></div>
+      <div class="kpi minor"><div class="v" id="trainTokV">–</div><div class="k">Train tok/s</div></div>
+      <div class="gpus" id="gpus"></div>
+    </div>
+    <div class="note" id="noteTrainer"></div>
+  </div>
+
+  <div class="card" id="cardEnv">
+    <div class="top">
+      <div class="icon"><svg viewBox="0 0 24 24"><path d="M12 2l9 5v10l-9 5-9-5V7z"/><path d="M12 22V12M21 7l-9 5-9-5"/></svg></div>
+      <div><h2>RL environments</h2><div class="sub">CoreWeave Sandboxes · CPU · NeMo-Gym</div></div>
+      <div class="state" id="stEnv">idle</div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="v" id="sbxV">–</div><div class="k">Sandboxes running</div></div>
+      <div class="kpi minor"><div class="v" id="rateV">–</div><div class="k">Graded / s</div></div>
+      <div class="kpi minor"><div class="v" id="gradedV">–</div><div class="k">Answers graded</div></div>
+      <div class="pool" id="pool"></div>
+    </div>
+    <div class="note" id="noteEnv"></div>
+  </div>
+
+  <div class="card" id="cardSampler">
+    <div class="top">
+      <div class="icon"><svg viewBox="0 0 24 24"><path d="M4 12h3l2-6 4 12 2-6h5"/></svg></div>
+      <div><h2>Sampler</h2><div class="sub">Dedicated Inference · H100 · vLLM</div></div>
+      <div class="state" id="stSampler">idle</div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><div class="v" id="tokV">–<small>tok/s</small></div><div class="k">Generated tokens</div></div>
+      <div class="kpi minor"><div class="v" id="inflightV">–</div><div class="k">Requests in flight</div></div>
+      <div class="kpi minor"><div class="v" id="weightsV">v0</div><div class="k">Weights</div></div>
+    </div>
+    <div class="note" id="noteSampler"></div>
+  </div>
+</section>
+
+<section class="charts">
+  <div class="chart"><div class="h"><b>Trainer</b><div class="legend"><span style="--c:#2374ff">GPU utilization, left</span><span class="dash" style="--c:#ffffff">GPUs, right</span></div></div><canvas id="cGpu"></canvas></div>
+  <div class="chart"><div class="h"><b>Rollout sandboxes</b><div class="legend"><span style="--c:#2374ff">running</span><span style="--c:#ffffff">in use</span><span style="--c:#ffb547">rollouts waiting</span></div></div><canvas id="cSbx"></canvas></div>
+  <div class="chart"><div class="h"><b>Sampler</b><div class="legend"><span style="--c:#2374ff">tokens/s, left</span><span class="dash" style="--c:#ffffff">GPUs, right</span></div></div><canvas id="cTok"></canvas></div>
+</section>
+
+<section class="steps">
+  <div class="panel">
+    <div class="h"><b>Where the time goes</b><span class="stat" id="overlapV"></span>
+      <div class="legend">
+        <span style="--c:#a9c8ff">train</span><span style="--c:#5c9bff">logprobs</span><span style="--c:#ffffff">weights to sampler</span>
+        <span style="--c:#262b3a">waiting</span><span style="--c:#ffb547">validate</span><span style="--c:#2374ff">rollouts, shaded by weights version</span>
+      </div></div>
+    <canvas id="cLanes"></canvas>
+  </div>
+  <div class="panel">
+    <div class="h"><b>Steps</b></div>
+    <div id="table"><div class="empty">Waiting for the first step…</div></div>
+  </div>
+</section>
+</div>
+
+<section class="below">
+  <div><h2>What the model wrote, and what ran in the sandbox</h2>
+    <p class="lead">The latest 30 finished rollouts from this run, newest first, right and wrong. Each rollout has its own sandbox: every python block the model writes is saved there as a file and run, and the output goes back to the model. The final answer is graded with math-verify in the same sandbox.</p></div>
+  <div class="examples" id="examples"></div>
+  <div class="panel bars">
+    <div class="h"><b>Where each step's time goes</b><span>the trainer's own timings</span>
+      <div class="legend">
+        <span style="--c:#ffffff">weight sync to sampler</span><span style="--c:#2374ff">generate + grade</span>
+        <span style="--c:#a9c8ff">train</span><span style="--c:#ffb547">validate</span><span style="--c:#545a6b">other</span>
+      </div></div>
+    <canvas id="cSteps"></canvas>
+  </div>
+</section>
+
+<script>
+const BLUE = "#2374ff", BLUE2 = "#5c9bff", BLUE3 = "#a9c8ff", WHITE = "#ffffff", GREEN = "#35d07f", AMBER = "#ffb547";
+const PHASE_COLOR = { export: WHITE, hotload: WHITE, generation: BLUE, rewards: BLUE, logprobs: "#545a6b", training: BLUE3, validation: AMBER };
+const PHASE_LABEL = { export: "exporting weights", hotload: "hot-loading", generation: "waiting on rollouts", rewards: "processing rewards",
+  logprobs: "logprobs", training: "training", validation: "validating" };
+const WINDOW_S = 360;
+const BRINGUP = [
+  ["storage", "object storage key"], ["gateway", "inference gateway"], ["gym", "NeMo-Gym sandbox"], ["node", "SUNK node"],
+  ["staged", "staging the model"], ["deployed", "inference deployment"], ["pool", "rollout sandboxes"], ["calibration", "verifier check"],
+];
+// Step time by part, from NeMo-RL's own timings once a step finishes; live phases while it runs.
+const PARTS = [["sync", WHITE], ["gen", BLUE], ["train", BLUE3], ["val", AMBER], ["other", "#545a6b"]];
+const PART_OF_PHASE = { export: "sync", hotload: "sync", generation: "gen", rewards: "gen", logprobs: "train", training: "train", validation: "val" };
+
+const S = {
+  meta: {}, t0: null, stages: {}, step: 0, of: 0, phase: null, phases: [], gpu: [], sampler: [], env: [], sbx: [],
+  steps: [], accuracy: [], hotloads: [], lastSampler: null, lastEnv: null, ended: false, deploy: [],
+  stepStart: {}, bgHotloads: {}, examples: [], examplesShown: null,
+};
+
+// ---------------------------------------------------------------- events
+function onEvent(e) {
+  if (S.t0 === null && Number.isFinite(e.t)) S.t0 = e.t;
+  switch (e.type) {
+    case "meta": Object.assign(S.meta, e);
+      $("algo").textContent = `· ${S.meta.async ? "Async GRPO" : "DAPO"}${S.meta.tir ? " with Python tool use" : ""} on Qwen2.5-Math-7B · NeMo-RL + NeMo-Gym`;
+      renderLinks(); break;
+    case "stage":
+      if (!S.stages[e.stage]) S.stages[e.stage] = { t: e.t, args: e.args };
+      if (e.stage === "run") S.meta.run_tag = e.args[0];
+      if (["job_end", "exit", "cleaned"].includes(e.stage) && !S.ended) { S.ended = true; S.endT = e.t; closePhase(e.t); }
+      break;
+    case "step": S.step = e.step; S.of = e.of; if (!S.stepStart[e.step]) S.stepStart[e.step] = e.t; break;
+    case "phase": setPhase(e.phase, e.t, e.step); break;
+    case "hotload": S.hotloads.push(e); break;
+    case "step_done": S.steps.push({ ...e }); break;
+    case "accuracy": S.accuracy.push(e); break;
+    case "metric": onMetric(e); break;
+  }
+}
+// The shared page and the run in CoreWeave Forge (W&B, Agent Lens, Weave): links in the header, from the run's meta.
+function renderLinks() {
+  const links = [...(S.meta.share_url ? [{ label: "Shared page", url: S.meta.share_url }] : []), ...(S.meta.links || [])];
+  $("links").replaceChildren(...links.filter((l) => /^https:\/\//.test(l.url)).map((l) => {
+    const a = document.createElement("a");
+    a.href = l.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = l.label + " ↗";
+    return a;
+  }));
+}
+function setPhase(phase, t, step) {
+  if (S.phase && S.phase.phase === phase) return;
+  closePhase(t);
+  S.phase = { phase, t0: t, t1: null, step };
+  S.phases.push(S.phase);
+}
+function closePhase(t) { if (S.phase && S.phase.t1 === null) S.phase.t1 = t; }
+const clampDt = (dt) => Math.min(Math.max(dt, 1), 3);
+function onMetric(e) {
+  if (e.k === "gpu") {
+    const util = e.util || [];
+    S.gpu.push({ t: e.t, avg: util.reduce((a, b) => a + b, 0) / Math.max(util.length, 1), util });
+  } else if (e.k === "sampler") {
+    const p = S.lastSampler;
+    const rate = p ? Math.max(e.gen_tokens - p.gen_tokens, 0) / clampDt(e.ts - p.ts) : 0;
+    S.sampler.push({ t: e.t, rate, inflight: e.inflight, done: e.done, tokens: e.gen_tokens });
+    S.lastSampler = e;
+  } else if (e.k === "env") {
+    const p = S.lastEnv;
+    const dt = p ? clampDt(e.ts - p.ts) : 1;
+    S.env.push({ t: e.t, pool: e.sandboxes, busy: e.busy, waiting: e.waiting, graded: e.graded, correct: e.correct,
+      gradeRate: p ? Math.max(e.graded - p.graded, 0) / dt : 0, started: e.started, max: e.max, min: e.min });
+    S.lastEnv = e;
+  } else if (e.k === "sandboxes") {
+    const running = e.states ? (e.states.running || 0) : e.total;
+    S.sbx.push({ t: e.t, total: e.total, running });
+  } else if (e.k === "deployment") {
+    S.deploy.push({ t: e.t, gpus: e.gpus, ready: e.ready });
+  } else if (e.k === "hotload") {  // a hot-load that runs in the background while the trainer goes on
+    const h = S.bgHotloads[e.version] || (S.bgHotloads[e.version] = { version: e.version });
+    h[e.state] = e.t;
+  } else if (e.k === "example") {
+    S.examples.push({ ...e, step: S.step });
+  }
+}
+
+// ---------------------------------------------------------------- canvas helpers
+function fit(canvas) {
+  const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w: r.width, h: r.height };
+}
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * p;
+}
+function fmt(v) {
+  if (v === null || v === undefined || isNaN(v)) return "–";
+  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (Math.abs(v) >= 1e4) return (v / 1e3).toFixed(1) + "k";
+  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(2) + "k";
+  return Math.round(v).toLocaleString();
+}
+const now = () => Date.now() / 1000;
+
+// A rolling time chart. series: [{get: rows, val: row => number, color, fill, step, decay}]
+function timeChart(canvas, opts) {
+  const { ctx, w, h } = fit(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const padL = 38, padR = opts.right ? 30 : 6, padT = 6, padB = 16;
+  const t1 = S.ended ? S.endT + 20 : now(), t0 = t1 - WINDOW_S;
+  const X = (t) => padL + (t - t0) / WINDOW_S * (w - padL - padR);
+  let max = opts.max || 0;
+  if (!opts.max) for (const s of opts.series) for (const r of s.rows) if (r.t >= t0) max = Math.max(max, s.val(r));
+  max = opts.max || niceMax(max * 1.1 || 1);
+  const Y = (v) => h - padB - (v / max) * (h - padT - padB);
+  if (opts.bands) for (const b of S.phases) {
+    const a = Math.max(X(b.t0), padL), z = Math.min(X(b.t1 || t1), w - padR);
+    if (z <= padL || a >= w - padR) continue;
+    ctx.fillStyle = (PHASE_COLOR[b.phase] || "#333") + "26";
+    ctx.fillRect(a, padT, z - a, h - padT - padB);
+  }
+  ctx.strokeStyle = "#1b1f2b"; ctx.lineWidth = 1; ctx.fillStyle = "#545a6b"; ctx.font = "10px Plus Jakarta Sans, sans-serif";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (let i = 0; i <= 2; i++) {
+    const v = max * i / 2, y = Y(v);
+    ctx.beginPath(); ctx.moveTo(padL, y + 0.5); ctx.lineTo(w - padR, y + 0.5); ctx.stroke();
+    ctx.fillText(fmt(v) + (opts.unit || ""), padL - 6, y);
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let m = 0; m <= WINDOW_S / 60; m++) {
+    const x = X(t1 - m * 60);
+    ctx.fillText(m === 0 ? "now" : `-${m}m`, Math.min(Math.max(x, padL + 10), w - padR - 12), h - padB + 4);
+  }
+  if (opts.right) drawRight(ctx, opts.right, X, t0, t1, w, h, padT, padB, padR);
+  for (const s of opts.series) {
+    let pts = s.rows.filter((r) => r.t >= t0 - 30).map((r) => [r.t, s.val(r)]);
+    if (!pts.length) continue;
+    if (s.decay) {  // reporters go quiet when idle: drop to zero across gaps
+      const filled = [];
+      pts.forEach((p, i) => {
+        if (i && p[0] - pts[i - 1][0] > 2.5) filled.push([pts[i - 1][0] + 1.5, 0], [p[0] - 1, 0]);
+        filled.push(p);
+      });
+      pts = filled;
+    }
+    const last = pts[pts.length - 1];
+    if (s.decay && t1 - last[0] > 2.5) pts.push([last[0] + 1.5, 0], [t1, 0]);
+    else pts.push([t1, last[1]]);
+    ctx.beginPath();
+    pts.forEach(([t, v], i) => {
+      const x = Math.max(X(t), padL), y = Y(v);
+      if (i === 0) ctx.moveTo(x, y);
+      else if (s.step) { ctx.lineTo(x, Y(pts[i - 1][1])); ctx.lineTo(x, y); }
+      else ctx.lineTo(x, y);
+    });
+    if (s.fill) {
+      ctx.save();
+      ctx.lineTo(Math.max(X(pts[pts.length - 1][0]), padL), Y(0)); ctx.lineTo(Math.max(X(pts[0][0]), padL), Y(0)); ctx.closePath();
+      const g = ctx.createLinearGradient(0, padT, 0, h - padB);
+      g.addColorStop(0, s.color + "99"); g.addColorStop(1, s.color + "08");
+      ctx.fillStyle = g; ctx.fill(); ctx.restore();
+      ctx.beginPath();
+      pts.forEach(([t, v], i) => {
+        const x = Math.max(X(t), padL), y = Y(v);
+        if (i === 0) ctx.moveTo(x, y); else if (s.step) { ctx.lineTo(x, Y(pts[i - 1][1])); ctx.lineTo(x, y); } else ctx.lineTo(x, y);
+      });
+    }
+    ctx.strokeStyle = s.color; ctx.lineWidth = s.width || 2; ctx.lineJoin = "round"; ctx.stroke();
+  }
+}
+
+// A step line on the right axis (GPU counts). Integer ticks, the line drops to 0 when the run ends.
+function drawRight(ctx, r, X, t0, t1, w, h, padT, padB, padR) {
+  const rows = r.rows.filter((row) => row.t >= t0 - 3600);
+  if (!rows.length) return;
+  const top = Math.max(2, Math.ceil(Math.max(...rows.map(r.val)) * 1.25 / 2) * 2);
+  const Y = (v) => h - padB - (v / top) * (h - padT - padB);
+  ctx.fillStyle = "#c9cdd6"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.font = "600 10px Plus Jakarta Sans, sans-serif";
+  for (let i = 0; i <= 2; i++) ctx.fillText(String(top * i / 2), w - padR + 6, Y(top * i / 2));
+  ctx.font = "10px Plus Jakarta Sans, sans-serif";
+  const pts = rows.map((row) => [row.t, r.val(row)]);
+  pts.push([r.end || t1, pts[pts.length - 1][1]]);
+  if (r.end) pts.push([r.end, 0], [t1, 0]);
+  ctx.save(); ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.setLineDash([6, 4]); ctx.beginPath();
+  pts.forEach(([t, v], i) => {
+    const x = Math.min(Math.max(X(t), X(t0)), X(t1)), y = Y(v);
+    if (i === 0) ctx.moveTo(x, y); else { ctx.lineTo(x, Y(pts[i - 1][1])); ctx.lineTo(x, y); }
+  });
+  ctx.stroke(); ctx.restore();
+  const last = pts[pts.length - 1][1];
+  if (last) { ctx.fillStyle = "#fff"; ctx.textAlign = "right"; ctx.textBaseline = "bottom"; ctx.font = "700 11px Plus Jakarta Sans, sans-serif";
+    ctx.fillText(`${last} GPU${last === 1 ? "" : "s"}`, X(t1) - 4, Y(last) - 3); ctx.font = "10px Plus Jakarta Sans, sans-serif"; }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  if (h <= 0) return;
+  r = Math.min(r, h / 2, w / 2);
+  ctx.beginPath(); ctx.moveTo(x, y + h); ctx.lineTo(x, y + r); ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.lineTo(x + w - r, y); ctx.quadraticCurveTo(x + w, y, x + w, y + r); ctx.lineTo(x + w, y + h); ctx.closePath(); ctx.fill();
+}
+
+// Where each step's time goes: one row per step, parts as segments
+// answers graded per second between two page times, from the grading server's counter
+function gradeRate(t0, t1) {
+  const inside = S.env.filter((r) => r.t >= t0 && r.t <= t1);
+  if (inside.length < 2) return 0;
+  const a = inside[0], b = inside[inside.length - 1];
+  return b.t > a.t ? Math.max(b.graded - a.graded, 0) / (b.t - a.t) : 0;
+}
+// a step's rollout throughput: answers graded in the step over its generate + grade time
+// (sync GRPO), or over the whole step when rollouts overlap training (async GRPO)
+function stepRate(done) {
+  const i = S.steps.indexOf(done), start = i > 0 ? S.steps[i - 1].t : done.t - (done.metrics.step_time || 0);
+  const inside = S.env.filter((r) => r.t >= start && r.t <= done.t);
+  if (inside.length < 2) return 0;
+  const graded = inside[inside.length - 1].graded - inside[0].graded;
+  const gen = (done.timings || {}).generation || 0;
+  const span = gen > 1 ? gen : done.t - start;
+  return span > 0 ? graded / span : 0;
+}
+function stepParts(done) {
+  const t = done.timings || {}, total = done.metrics.step_time || 0;
+  // async GRPO names these weight_sync and exposed_generation (time the trainer waited on rollouts)
+  const sync = t["prepare_for_generation/total"] ?? t.weight_sync ?? ((t["prepare_for_generation/export_weights"] || 0) + (t["prepare_for_generation/hot_load"] || 0));
+  const parts = { sync, gen: t.generation || t.exposed_generation || 0,
+    train: (t.policy_training || 0) + (t.policy_and_reference_logprobs || 0) + (t.logprob_inference_prep || 0) + (t.training_prep || 0),
+    val: t.validation || 0 };
+  parts.other = Math.max(total - parts.sync - parts.gen - parts.train - parts.val, 0);
+  return { parts, total };
+}
+function liveParts(step) {
+  const parts = { sync: 0, gen: 0, train: 0, val: 0, other: 0 };
+  for (const p of S.phases) if (p.step === step) parts[PART_OF_PHASE[p.phase] || "other"] += (p.t1 || now()) - p.t0;
+  return { parts, total: Object.values(parts).reduce((a, b) => a + b, 0), live: true };
+}
+function stepTimeline(canvas) {
+  const { ctx, w, h } = fit(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const rows = S.steps.map((d) => ({ step: d.step, rate: stepRate(d), ...stepParts(d) }));
+  const lastDone = rows.length ? rows[rows.length - 1].step : 0;
+  if (S.step > lastDone && !S.ended) rows.push({ step: S.step, ...liveParts(S.step) });
+  const shown = rows.slice(-7);
+  ctx.font = "11px Plus Jakarta Sans, sans-serif";
+  if (!shown.length) { ctx.fillStyle = "#545a6b"; ctx.textBaseline = "top"; ctx.fillText("The first step starts after bring-up (about 7 minutes)", 4, 8); return; }
+  const longest = Math.max(60, ...shown.map((r) => r.total));
+  const padL = 56, padR = 250, rowH = Math.min(28, (h - 8) / shown.length - 6);
+  const scale = (w - padL - padR) / niceMax(longest);
+  shown.forEach((r, i) => {
+    const y = 4 + i * (rowH + 6);
+    ctx.fillStyle = "#8b91a3"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(`step ${r.step}`, 0, y + rowH / 2);
+    let x = padL;
+    for (const [key, color] of PARTS) {
+      const d = r.parts[key]; if (d < 0.5) continue;
+      const segW = Math.max(d * scale, 1.5);
+      ctx.fillStyle = color; ctx.globalAlpha = r.live ? 0.55 + 0.3 * Math.abs(Math.sin(now() * 2.5)) : 0.92;
+      roundRect(ctx, x, y, segW - 1.5, rowH, 4); ctx.globalAlpha = 1;
+      if (segW > 40) { ctx.fillStyle = key === "gen" || key === "other" ? "#fff" : "#000"; ctx.textAlign = "left"; ctx.fillText(`${Math.round(d)}s`, x + 7, y + rowH / 2 + 0.5); }
+      x += segW;
+    }
+    const trainPct = r.total ? Math.round(100 * r.parts.train / r.total) : 0;
+    ctx.fillStyle = "#fff"; ctx.textAlign = "left"; ctx.fillText(`${Math.round(r.total)}s`, x + 8, y + rowH / 2);
+    ctx.fillStyle = "#8b91a3"; ctx.fillText(r.live ? "running" : `training ${trainPct}% · ${r.rate.toFixed(1)} graded/s`, x + 48, y + rowH / 2);
+  });
+}
+
+// Where the time goes, on one wall clock: the trainer's phases, the weights on their way to the
+// sampler, and the rollouts that the sampler and the sandboxes work on meanwhile. In async GRPO
+// the rollouts for the next steps keep going while the trainer trains, so the lanes overlap.
+const LANE_WINDOW_S = 720;
+const TRAINER_STYLE = { training: [BLUE3, "train"], logprobs: [BLUE2, "logprobs"], export: [WHITE, "export"], hotload: [WHITE, "hot-load"],
+  validation: [AMBER, "validate"], generation: ["#262b3a", "waiting"], rewards: ["#262b3a", "waiting"] };
+const VERSION_COLOR = [BLUE, "#7fb0ff"];
+// when each weights version went live on the sampler
+function liveVersions() {
+  const at = new Map();
+  for (const h of S.hotloads) at.set(h.version, Math.min(at.get(h.version) ?? Infinity, h.t));
+  for (const h of Object.values(S.bgHotloads)) if (h.done) at.set(h.version, Math.min(at.get(h.version) ?? Infinity, h.done));
+  return [...at].map(([v, t]) => ({ v, t })).sort((a, b) => a.t - b.t);
+}
+// weights on their way to the sampler: the export (the trainer waits for it), then the upload and
+// hot-load, from the background hot-load's own events when the run has them
+function weightSegments() {
+  const segs = S.phases.filter((p) => p.phase === "export").map((p) => ({ t0: p.t0, t1: p.t1, label: "export", v: p.step + 1 }));
+  const bg = Object.values(S.bgHotloads).filter((h) => h.start);
+  if (bg.length) for (const h of bg) segs.push({ t0: h.start, t1: h.done || null, label: "hot-load", v: h.version });
+  else for (const p of S.phases) if (p.phase === "hotload") segs.push({ t0: p.t0, t1: p.t1, label: "hot-load", v: p.step + 1 });
+  return segs;
+}
+// reporters go quiet when idle: drop to zero across gaps
+function lanePoints(rows, val, t0, t1) {
+  const pts = [];
+  rows.forEach((r, i) => {
+    if (r.t < t0 - 30) return;
+    const p = rows[i - 1];
+    if (p && r.t - p.t > 2.5) pts.push([p.t + 1.5, 0], [r.t - 1, 0]);
+    pts.push([r.t, val(r)]);
+  });
+  if (!pts.length) return pts;
+  const last = pts[pts.length - 1];
+  if (t1 - last[0] > 2.5) pts.push([last[0] + 1.5, 0], [t1, 0]); else pts.push([t1, last[1]]);
+  return pts;
+}
+// share of the trainer's train + logprobs time during which the sampler had rollouts in flight
+function overlapShare() {
+  const rows = S.sampler;
+  let busy = 0, total = 0, i = 0;
+  for (const p of S.phases) {
+    if (p.phase !== "training" && p.phase !== "logprobs") continue;
+    for (let t = p.t0; t < (p.t1 || now()); t += 1) {
+      while (i + 1 < rows.length && rows[i + 1].t <= t) i++;
+      total++;
+      if (rows[i] && rows[i].t <= t && t - rows[i].t < 3 && rows[i].inflight > 0) busy++;
+    }
+  }
+  return total > 30 ? busy / total : null;
+}
+function laneTimeline(canvas) {
+  const { ctx, w, h } = fit(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const padL = 96, padR = 8, padT = 16, padB = 16, gap = 7;
+  const t1 = S.ended ? S.endT + 20 : now(), t0 = t1 - LANE_WINDOW_S;
+  const X = (t) => padL + (t - t0) / LANE_WINDOW_S * (w - padL - padR);
+  const Xc = (t) => Math.min(Math.max(X(t), padL), w - padR);
+  const usable = h - padT - padB - 3 * gap;
+  const lanes = [["Trainer", "8× H100", 0.32], ["Weights", "to the sampler", 0.16], ["Sampler", "rollouts in flight", 0.26], ["Sandboxes", "running code", 0.26]];
+  let y = padT;
+  const L = lanes.map(([name, sub, share]) => { const lane = { name, sub, y, h: usable * share }; y += lane.h + gap; return lane; });
+  const [trainer, weights, sampler, sandboxes] = L;
+  ctx.font = "11px Plus Jakarta Sans, sans-serif"; ctx.textBaseline = "middle";
+  for (const lane of L) {
+    ctx.fillStyle = "#0f121a"; ctx.fillRect(padL, lane.y, w - padL - padR, lane.h);
+    ctx.textAlign = "left"; ctx.fillStyle = "#fff"; ctx.font = "700 12px Plus Jakarta Sans, sans-serif";
+    ctx.fillText(lane.name, 0, lane.y + lane.h / 2 - 6);
+    ctx.fillStyle = "#8b91a3"; ctx.font = "10.5px Plus Jakarta Sans, sans-serif";
+    ctx.fillText(lane.sub, 0, lane.y + lane.h / 2 + 8);
+  }
+  ctx.save(); ctx.beginPath(); ctx.rect(padL, 0, w - padL - padR, h); ctx.clip();
+  // rollouts, colored by the weights version the sampler served
+  const live = liveVersions();
+  const bands = [{ v: 0, t0: -Infinity, t1: live.length ? live[0].t : Infinity }];
+  live.forEach((l, i) => bands.push({ v: l.v, t0: l.t, t1: i + 1 < live.length ? live[i + 1].t : Infinity }));
+  const area = (lane, pts) => {
+    if (!pts.length) return;
+    const max = niceMax(Math.max(...pts.map((p) => p[1])) * 1.05 || 1);
+    const Y = (v) => lane.y + lane.h - (v / max) * (lane.h - 2);
+    for (const b of bands) {
+      const a = Xc(b.t0), z = Xc(b.t1); if (z <= a) continue;
+      ctx.save(); ctx.beginPath(); ctx.rect(a, lane.y, z - a, lane.h); ctx.clip();
+      ctx.beginPath(); ctx.moveTo(X(pts[0][0]), lane.y + lane.h);
+      for (const [t, v] of pts) ctx.lineTo(X(t), Y(v));
+      ctx.lineTo(X(pts[pts.length - 1][0]), lane.y + lane.h); ctx.closePath();
+      ctx.fillStyle = VERSION_COLOR[b.v % 2]; ctx.fill(); ctx.restore();
+    }
+    ctx.fillStyle = "#545a6b"; ctx.textAlign = "right"; ctx.textBaseline = "top"; ctx.font = "10px Plus Jakarta Sans, sans-serif";
+    ctx.fillText(`max ${fmt(max)}`, w - padR - 4, lane.y + 2);
+  };
+  area(sampler, lanePoints(S.sampler, (r) => r.inflight, t0, t1));
+  area(sandboxes, lanePoints(S.env, (r) => r.busy, t0, t1));
+  ctx.font = "600 10px Plus Jakarta Sans, sans-serif"; ctx.textBaseline = "top"; ctx.textAlign = "left";
+  for (const b of bands) {
+    if (b.t0 === -Infinity || X(b.t0) < padL - 1 || X(b.t0) > w - padR) continue;
+    const x = X(b.t0);  // the new weights land on the sampler
+    ctx.fillStyle = "#fff"; ctx.fillRect(x - 0.75, weights.y, 1.5, sandboxes.y + sandboxes.h - weights.y);
+    ctx.fillText(`v${b.v} live`, x + 4, sampler.y + 2);
+  }
+  // the trainer, one phase after another
+  const seg = (lane, a, z, color, label, dim) => {
+    const x0 = Xc(a), x1 = Xc(z); if (x1 - x0 < 0.5) return;
+    ctx.fillStyle = color; roundRect(ctx, x0, lane.y + 2, Math.max(x1 - x0 - 1, 1), lane.h - 4, 4);
+    ctx.font = "600 10.5px Plus Jakarta Sans, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+    const text = [`${label} ${Math.round(z - a)}s`, label].find((t) => ctx.measureText(t).width + 10 < x1 - x0);
+    if (text) { ctx.fillStyle = dim ? "#8b91a3" : "#000"; ctx.fillText(text, x0 + 5, lane.y + lane.h / 2 + 0.5); }
+  };
+  for (const p of S.phases) {
+    const style = TRAINER_STYLE[p.phase]; if (!style) continue;
+    const end = p.t1 || (S.ended ? S.endT : now());
+    if (end < t0 || p.t0 > t1) continue;
+    seg(trainer, p.t0, end, style[0], style[1], style[0] === "#262b3a");
+  }
+  for (const s of weightSegments()) {
+    const end = s.t1 || (S.ended ? S.endT : now());
+    if (end < t0 || s.t0 > t1) continue;
+    seg(weights, s.t0, end, s.label === "export" ? WHITE : "#c9cdd6", `v${s.v} ${s.label}`);
+  }
+  ctx.font = "600 10px Plus Jakarta Sans, sans-serif"; ctx.textBaseline = "bottom"; ctx.textAlign = "left";
+  for (const [step, t] of Object.entries(S.stepStart)) {
+    const x = X(t); if (x < padL - 1 || x > w - padR) continue;
+    ctx.fillStyle = "#8b91a3"; ctx.fillRect(x - 0.5, trainer.y - 4, 1, trainer.h + 4);
+    ctx.fillText(`step ${step}`, x + 4, trainer.y - 2);
+  }
+  ctx.restore();
+  ctx.fillStyle = "#545a6b"; ctx.font = "10px Plus Jakarta Sans, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (let m = 0; m <= LANE_WINDOW_S / 60; m += 2) {
+    const x = X(t1 - m * 60);
+    ctx.fillText(m === 0 ? "now" : `-${m}m`, Math.min(Math.max(x, padL + 10), w - padR - 12), h - padB + 3);
+  }
+  if (!S.phases.length) {
+    ctx.fillStyle = "#545a6b"; ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.font = "11px Plus Jakarta Sans, sans-serif";
+    ctx.fillText("The first step starts after bring-up (about 7 minutes)", padL + 8, trainer.y + trainer.h / 2);
+  }
+}
+
+// ---------------------------------------------------------------- architecture flows
+const FLOWS = [
+  { id: "prompts", from: "cardTrainer", to: "cardEnv", side: 0.34, label: "prompts", color: BLUE2 },
+  { id: "rewards", from: "cardEnv", to: "cardTrainer", side: 0.70, label: "rewards", color: GREEN },
+  { id: "generate", from: "cardEnv", to: "cardSampler", side: 0.34, label: "generate", color: BLUE2 },
+  { id: "tokens", from: "cardSampler", to: "cardEnv", side: 0.70, label: "tokens", color: BLUE3 },
+  { id: "weights", from: "cardTrainer", to: "cardSampler", arc: true, label: "", color: WHITE },
+];
+const dots = {};
+function layoutFlows() {
+  const svg = document.getElementById("flows"), arch = document.getElementById("arch").getBoundingClientRect();
+  svg.innerHTML = "";
+  for (const f of FLOWS) {
+    const a = document.getElementById(f.from).getBoundingClientRect(), b = document.getElementById(f.to).getBoundingClientRect();
+    let d, lx, ly;
+    if (f.arc) {
+      const x1 = a.left + a.width * 0.5 - arch.left, x2 = b.left + b.width * 0.5 - arch.left, y = a.top - arch.top;
+      d = `M ${x1} ${y} C ${x1} ${y - 30}, ${x1 + 40} ${y - 22}, ${(x1 + x2) / 2} ${y - 22} S ${x2} ${y - 30}, ${x2} ${y}`;
+    } else {
+      const leftToRight = a.left < b.left;
+      const x1 = (leftToRight ? a.right : a.left) - arch.left, x2 = (leftToRight ? b.left : b.right) - arch.left;
+      const y = a.top - arch.top + a.height * f.side;
+      d = `M ${x1} ${y} L ${x2} ${y}`; lx = (x1 + x2) / 2; ly = y - 7;
+    }
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d); path.setAttribute("stroke", "#262b3a"); path.setAttribute("stroke-width", "1.5"); path.setAttribute("fill", "none");
+    if (!f.arc) path.setAttribute("stroke-dasharray", "3 5");
+    svg.appendChild(path);
+    if (f.label) {
+      const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      t.setAttribute("x", lx); t.setAttribute("y", ly); t.setAttribute("text-anchor", "middle"); t.setAttribute("class", "flowlabel"); t.id = "lbl-" + f.id;
+      t.textContent = f.label; svg.appendChild(t);
+    }
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g"); svg.appendChild(g);
+    dots[f.id] = { path, g, len: path.getTotalLength(), particles: (dots[f.id] || {}).particles || [], color: f.color, rate: 0, acc: 0 };
+  }
+}
+function animateFlows(dt) {
+  for (const f of FLOWS) {
+    const d = dots[f.id]; if (!d) continue;
+    d.acc += d.rate * dt;
+    while (d.acc >= 1 && d.particles.length < 40) { d.particles.push(0); d.acc -= 1; }
+    if (d.acc > 1) d.acc = 0;
+    const speed = f.arc ? 0.45 : 0.9;
+    d.particles = d.particles.map((p) => p + dt * speed).filter((p) => p < 1);
+    while (d.g.childNodes.length < d.particles.length) {
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle"); c.setAttribute("r", f.arc ? 4 : 3); c.setAttribute("fill", d.color); d.g.appendChild(c);
+    }
+    while (d.g.childNodes.length > d.particles.length) d.g.removeChild(d.g.lastChild);
+    d.particles.forEach((p, i) => {
+      const pt = d.path.getPointAtLength(p * d.len), c = d.g.childNodes[i];
+      c.setAttribute("cx", pt.x); c.setAttribute("cy", pt.y); c.setAttribute("opacity", Math.sin(Math.PI * p) * 0.9 + 0.1);
+    });
+    const lbl = document.getElementById("lbl-" + f.id); if (lbl) lbl.classList.toggle("on", d.rate > 0.05);
+  }
+}
+
+// ---------------------------------------------------------------- DOM updates
+const $ = (id) => document.getElementById(id);
+function recent(rows, maxAge = 4) { const r = rows[rows.length - 1]; return r && now() - r.t < maxAge ? r : null; }
+function renderBringup() {
+  let text = "";
+  if (!S.ended && !S.step && S.t0 !== null) {
+    const next = BRINGUP.find(([key]) => !S.stages[key]);
+    if (next) text = `Bringing up <b>${next[1]}</b> · ${mmss(now() - S.t0)}`;
+  }
+  if ($("bringup").innerHTML !== text) $("bringup").innerHTML = text;
+}
+function mmss(s) { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(x).padStart(2, "0")}` : `${m}:${String(x).padStart(2, "0")}`; }
+
+function renderCards() {
+  const phase = S.ended ? null : S.phase && S.phase.phase;
+  const gpu = recent(S.gpu, 8), samp = recent(S.sampler, 3), env = recent(S.env, 3), sbx = S.sbx[S.sbx.length - 1];
+  // trainer
+  const tActive = ["export", "logprobs", "training", "validation", "rewards"].includes(phase) || (gpu && gpu.avg > 20);
+  $("cardTrainer").classList.toggle("on", !!tActive);
+  const stT = $("stTrainer");
+  stT.textContent = phase ? PHASE_LABEL[phase] : S.ended ? "done" : S.stages.node ? "starting" : "waiting";
+  stT.className = "state " + (["training", "logprobs", "export"].includes(phase) ? "on" : phase === "hotload" ? "alt" : "");
+  $("gpuV").innerHTML = (gpu ? Math.round(gpu.avg) : "–") + "<small>%</small>";
+  const lastStep = S.steps[S.steps.length - 1];
+  $("trainTokV").textContent = lastStep ? fmt(lastStep.metrics.train_tokens_s) : "–";
+  const gpus = $("gpus"); if (!gpus.children.length) gpus.innerHTML = "<div><b></b></div>".repeat(8);
+  [...gpus.children].forEach((d, i) => { d.firstChild.style.height = (gpu && gpu.util[i] !== undefined ? gpu.util[i] : 0) + "%"; });
+  // environments
+  const busy = env ? env.busy : 0, pool = env ? env.pool : (S.lastEnv ? S.lastEnv.sandboxes : 0);
+  $("cardEnv").classList.toggle("on", busy > 0 || phase === "generation");
+  const stE = $("stEnv");
+  stE.textContent = busy > 0 ? `${busy} in use` : phase === "generation" ? "running rollouts" : S.stages.gym ? "ready" : "waiting";
+  stE.className = "state " + (busy > 0 || phase === "generation" ? "on" : "");
+  $("sbxV").textContent = sbx ? sbx.running : "–";
+  $("gradedV").textContent = S.lastEnv ? fmt(S.lastEnv.graded) : "–";
+  const live = gradeRate(now() - 5, now());
+  $("rateV").textContent = S.lastEnv ? (live >= 10 ? Math.round(live) : live.toFixed(1)) : "–";
+  const pool_max = (S.lastEnv && S.lastEnv.max) || S.meta.pool_max || 32;
+  const pool_min = (S.lastEnv && S.lastEnv.min) || S.meta.pool_min || 0;
+  const max = Math.max(pool_max, pool, 32);
+  // at most 128 dots: past that, one dot stands for several sandboxes
+  const unit = Math.ceil(max / 128), dots = Math.ceil(max / unit);
+  const poolEl = $("pool");
+  if (poolEl.children.length !== dots + 1) {
+    poolEl.innerHTML = "<div></div>".repeat(dots + 1);
+    poolEl.style.gridTemplateColumns = `repeat(${dots > 64 ? 32 : 16}, 1fr)`;
+    poolEl.title = unit > 1 ? `one dot = ${unit} sandboxes` : "";
+  }
+  [...poolEl.children].forEach((d, i) => { d.className = i === 0 ? (S.stages.gym && !S.ended ? "gym" : "") : (i - 1) * unit < busy ? "busy" : (i - 1) * unit < pool ? "up" : ""; });
+  // sampler
+  const sActive = samp && samp.inflight > 0;
+  const hotloading = phase === "hotload" || (!S.ended && Object.values(S.bgHotloads).some((h) => h.start && !h.done));
+  $("cardSampler").classList.toggle("on", !!sActive || hotloading);
+  const stS = $("stSampler");
+  stS.textContent = hotloading ? "loading new weights" : sActive ? "generating" : S.stages.deployed ? "ready" : S.stages.deployment ? "deploying" : "waiting";
+  stS.className = "state " + (hotloading ? "alt" : sActive ? "on" : "");
+  $("tokV").innerHTML = (samp ? fmt(samp.rate) : "–") + "<small>tok/s</small>";
+  $("inflightV").textContent = samp ? samp.inflight : "–";
+  const hl = S.hotloads[S.hotloads.length - 1], lv = liveVersions();
+  $("weightsV").textContent = "v" + (lv.length ? lv[lv.length - 1].v : 0);
+  $("storage").classList.toggle("on", phase === "export" || hotloading);
+  $("hotloadV").textContent = hotloading ? "· uploading + hot-loading" : phase === "export" ? "· exporting" : hl ? `· last ${hl.gib} GiB in ${hl.load_s}s` : "";
+  // notes: what each part is doing right now
+  const dep = S.deploy[S.deploy.length - 1], replicas = dep ? dep.ready : (S.meta.replicas || 2);
+  const notes = {
+    export: ["<b>Exporting new weights.</b> Rank 0 writes the updated policy.", "Paused until the new weights arrive."],
+    hotload: ["<b>Sending 14 GiB of weights</b> to object storage.", `<b>Hot-loading new weights</b> into ${replicas} replica${replicas === 1 ? "" : "s"}, no restart.`],
+    generation: ["<b>Waiting on rollouts.</b> Training GPUs sit idle until every answer is graded.", `<b>${samp ? samp.inflight : 0} rollouts generating</b> on ${replicas} replica${replicas === 1 ? "" : "s"}.`],
+    rewards: ["<b>Turning grades into rewards</b> and advantages.", "Done with this batch."],
+    logprobs: ["<b>Scoring every token</b> under the current policy.", "Idle until the next step's weights."],
+    training: ["<b>Updating the policy</b> on 8 GPUs.", "Idle until the next step's weights."],
+    validation: ["<b>Validating</b> on AIME 2024.", "<b>Generating AIME answers</b> for validation."],
+  };
+  if (S.meta.async) notes.generation[0] = "<b>Waiting on rollouts.</b> The replay buffer fills up to a full batch.";
+  let [nt, ns] = phase ? notes[phase]
+    : S.ended ? [S.stages.cleaned ? "Run finished. Everything it created is deleted." : "Run finished. Deleting what it created.", S.stages.cleaned ? "Deployment deleted." : "Deleting the deployment."]
+    : ["Starting up.", S.stages.deployed ? "Serving the base model." : "Waiting for the deployment."];
+  // async GRPO: the sampler keeps generating, and hot-loads, while the trainer trains
+  if (phase && phase !== "hotload" && hotloading) ns = notes.hotload[1];
+  else if (phase && S.meta.async && sActive) ns = notes.generation[1];
+  $("noteTrainer").innerHTML = nt; $("noteSampler").innerHTML = ns;
+  const cells = S.lastEnv && S.lastEnv.cells;
+  $("noteEnv").innerHTML = S.lastEnv && S.meta.tir
+    ? `<b>One sandbox per rollout:</b> runs its code, then grades it. ${pool} of max ${pool_max}${env && env.waiting ? `, <b>${env.waiting} rollouts waiting</b>` : ""}${cells ? ` · ${fmt(cells)} code cells run` : ""}`
+    : S.lastEnv
+    ? `<b>Every answer is graded in a sandbox.</b> ${pool} of max ${pool_max}${env && env.waiting ? `, <b>${env.waiting} answers waiting</b>` : ""}${pool_min >= pool_max ? ", all kept warm." : ": grows with each burst, shrinks when idle."}`
+    : S.stages.gym ? "<b>NeMo-Gym runs in a sandbox.</b> Rollout sandboxes start on first use." : "";
+  // flows
+  if (dots.prompts) {
+    dots.prompts.rate = phase === "generation" ? 4 : 0;
+    dots.generate.rate = samp ? Math.min(samp.inflight / 12, 14) : 0;
+    dots.tokens.rate = samp ? Math.min(samp.rate / 800, 16) : 0;
+    dots.rewards.rate = env ? Math.min(env.gradeRate / 2, 12) : 0;
+    dots.weights.rate = hotloading || phase === "export" ? 3 : 0;
+  }
+  // header
+  $("stepV").firstChild.textContent = S.step || "–";
+  $("stepOf").textContent = S.of ? ` / ${S.of}` : "";
+  const last = S.steps[S.steps.length - 1];
+  $("rewardV").textContent = last && last.metrics.total_reward !== undefined ? last.metrics.total_reward.toFixed(2) : last && last.metrics.reward !== undefined ? last.metrics.reward.toFixed(2) : "–";
+  $("sbxTotalV").textContent = S.lastEnv ? fmt(S.lastEnv.started + 1) : "–";
+  const done = S.steps.map(stepParts).filter((r) => r.total);
+  $("busyV").textContent = done.length ? Math.round(100 * done.reduce((a, r) => a + r.parts.train, 0) / done.reduce((a, r) => a + r.total, 0)) + "%" : "–";
+  $("elapsedV").textContent = S.t0 === null ? "0:00" : mmss((S.ended ? S.endT : now()) - S.t0);
+  $("runtag").textContent = S.meta.run_tag || "";
+  const mode = S.meta.mode || "live";
+  $("mode").className = "pill " + (S.ended ? "" : mode); $("modeText").textContent = S.ended ? (S.stages.cleaned ? "finished" : "cleaning up") : mode === "replay" ? "replay of a real run" : "live";
+}
+const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+// the DAPO prompt wraps every problem in the same instructions; dim them so the problem stands out
+const PROMPT_FRAME = /^(Solve the following math problem[^\n]*\n\n)([\s\S]*?)(\n\nRemember to put your answer[^\n]*)$/;
+function problemHtml(prompt) {
+  const m = PROMPT_FRAME.exec(prompt || "");
+  return m ? `<span class="frame">${esc(m[1])}</span>${esc(m[2])}<span class="frame">${esc(m[3])}</span>` : esc(prompt);
+}
+function exampleCard(e) {
+  const verdict = e.reward > 0 ? ["ok", "correct"] : e.answer == null ? ["", "no answer"] : ["bad", "incorrect"];
+  const turns = (e.turns || []).map((t) => {
+    let html = t.text ? `<div class="say${t.text.length < 300 ? " short" : ""}">${esc(t.text)}</div>` : "";
+    if (t.code !== undefined) {
+      html += `<div><div class="k">ran in ${e.sandbox ? `sandbox <b title="${esc(e.sandbox)}">${esc(e.sandbox.slice(0, 8))}</b>` : "its sandbox"} as <b>${esc(t.cell)}</b></div><pre class="code">${esc(t.code)}</pre></div>`;
+      if (t.output !== undefined) html += `<div><div class="k">output</div><pre class="out">${esc(t.output.trim() || "(no output)")}</pre></div>`;
+    }
+    return html;
+  }).join("");
+  return `<div class="ex">
+    <div class="side">
+      <div class="top"><span class="badge ${verdict[0]}">${verdict[1]}</span><span>reward ${Number(e.reward).toFixed(1)} · ${e.cells} code cell${e.cells === 1 ? "" : "s"}</span><span class="when">during step ${e.step || "–"}</span></div>
+      <div><div class="k">Problem</div><div class="problem">${problemHtml(e.prompt)}</div></div>
+      <div class="answer"><span>Answer <b>${esc(e.answer ?? "none")}</b></span><span>Expected <b>${esc(e.expected)}</b></span></div>
+    </div>
+    <div class="work">${turns}</div>
+  </div>`;
+}
+function renderExamples() {
+  const key = `${S.examples.length}:${S.meta.tir}`;
+  if (S.examplesShown === key) return;
+  S.examplesShown = key;
+  // keep what the reader is looking at in place when a new card arrives on top
+  const list = $("examples"), top = list.scrollTop, before = list.scrollHeight;
+  list.innerHTML = S.examples.length ? S.examples.slice(-30).reverse().map(exampleCard).join("")
+    : `<div class="empty">${S.meta.tir === false ? "This run grades answers without tool use, so its rollouts run no code." : "Rollouts show up here as they finish, a few per step."}</div>`;
+  if (top > 0) list.scrollTop = top + list.scrollHeight - before;
+}
+function renderTable() {
+  const rows = S.steps.slice(-5);
+  if (!rows.length) return;
+  const acc = new Map(S.accuracy.map((a) => [a.step, a.accuracy]));
+  let html = "<table><tr><th>Step</th><th>Time</th><th>Gen tok/s</th><th>Train tok/s</th><th>Reward</th><th>KL err</th><th>AIME</th></tr>";
+  for (const s of rows) {
+    const m = s.metrics, r = m.total_reward !== undefined ? m.total_reward : m.reward;
+    html += `<tr><td>${s.step}</td><td>${Math.round(m.step_time || 0)}s</td><td>${fmt(m.gen_tokens_s)}</td><td>${fmt(m.train_tokens_s)}</td>
+      <td>${r !== undefined ? r.toFixed(2) : "–"}</td><td>${m.kl_error !== undefined ? m.kl_error.toFixed(4) : "–"}</td><td>${acc.has(s.step) ? (acc.get(s.step) * 100).toFixed(1) + "%" : "–"}</td></tr>`;
+  }
+  $("table").innerHTML = html + "</table>";
+}
+function drawCharts() {
+  const cleaned = S.stages.cleaned ? S.stages.cleaned.t : null;
+  const trainerEnd = S.stages.job_end ? S.stages.job_end.t : cleaned;
+  timeChart($("cGpu"), { bands: true, max: 100, unit: "%", series: [{ rows: S.gpu, val: (r) => r.avg, color: BLUE, fill: true }],
+    right: { rows: S.gpu.length ? [S.gpu[0]] : [], val: (r) => r.util.length || S.meta.trainer_gpus || 8, end: trainerEnd } });
+  timeChart($("cSbx"), { series: [
+    { rows: S.sbx, val: (r) => r.running, color: BLUE, fill: true, step: true },
+    { rows: S.env, val: (r) => r.busy, color: WHITE, step: true, decay: true, width: 1.6 },
+    { rows: S.env, val: (r) => r.waiting, color: AMBER, step: true, decay: true, width: 1.6 },
+  ] });
+  const samplerGpus = S.deploy.length ? S.deploy
+    : S.stages.deployed ? [{ t: S.stages.deployed.t, gpus: (S.meta.replicas || 2) * (S.meta.gpus_per_replica || 1) }] : [];
+  timeChart($("cTok"), { bands: true, series: [{ rows: S.sampler, val: (r) => r.rate, color: BLUE, fill: true, decay: true }],
+    right: { rows: samplerGpus, val: (r) => r.gpus, end: cleaned } });
+  stepTimeline($("cSteps"));
+  laneTimeline($("cLanes"));
+  const share = overlapShare();
+  $("overlapV").innerHTML = share === null ? "" : `rollouts kept generating through <b>${Math.round(share * 100)}%</b> of training time`;
+}
+
+// ---------------------------------------------------------------- loop
+let lastFrame = performance.now(), lastSlow = 0;
+function frame(ts) {
+  const dt = Math.min((ts - lastFrame) / 1000, 0.1); lastFrame = ts;
+  animateFlows(dt);
+  if (ts - lastSlow > 250) { lastSlow = ts; renderCards(); renderBringup(); renderTable(); renderExamples(); drawCharts(); }
+  requestAnimationFrame(frame);
+}
+window.addEventListener("resize", () => { layoutFlows(); drawCharts(); });
+
+function connect() {
+  const es = new EventSource("/events");
+  let loaded = false;
+  // A reconnect sends the whole backlog again; start over from a clean page.
+  es.addEventListener("backlog", (m) => { if (loaded) return location.reload(); loaded = true; for (const e of JSON.parse(m.data)) onEvent(e); });
+  es.onmessage = (m) => onEvent(JSON.parse(m.data));
+  es.onerror = () => { $("modeText").textContent = "reconnecting"; };
+}
+fetch("/meta").then((r) => r.json()).then((m) => onEvent({ type: "meta", ...m })).catch(() => {});
+document.fonts.ready.then(() => { layoutFlows(); requestAnimationFrame(frame); });
+connect();
+</script>
+</body>
+</html>
