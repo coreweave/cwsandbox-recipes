@@ -138,3 +138,50 @@ def test_the_local_page_moves_to_a_free_port_when_its_port_is_taken():
             assert response.status == 200
     finally:
         taken.close()
+
+
+def test_off_policy_adds_the_samplers_lag_to_nemo_rls_trajectory_age():
+    """v1 was exported but not loaded when step 2 sampled its batch: its rollouts are 1 step
+    older than NeMo-RL's own age says."""
+    hub = Hub()
+    parser = LineParser(hub)
+    for line in [
+        "========================= Step 1/3 =========================",
+        "[grpo] hot-load v1: exporting weights",
+        "========================= Step 2/3 =========================",
+        "  • Avg Trajectory Age: 0.50 steps",
+        "  • Total step time: 40.00s",
+        "    - Generation Worker Group (Tokens/sec): 900.00",
+    ]:
+        parser.feed(line)
+    done = [e for e in hub.events if e["type"] == "step_done"]
+    assert done[0]["metrics"]["trajectory_age"] == 0.5 and done[0]["metrics"]["sampler_lag"] == 1
+    assert done[0]["metrics"]["off_policy"] == 1.5
+
+
+def test_gpu_sandbox_run_reaches_every_stage():
+    hub = Hub()
+    parser = LineParser(hub)
+    for line in [
+        "[grpo] sampler-0: sandbox abc requested (1 GPU)",
+        "[grpo] trainer: sandbox abc-9x5m6",
+        "[grpo] sampler: passed to the trainer and to Gym",
+        "[grpo] trainer: sandbox completed, exit code 0",
+        "[grpo] cleanup: done",
+    ]:
+        parser.feed(line)
+    stages = [e["stage"] for e in hub.events if e["type"] == "stage"]
+    assert stages == ["deployment", "node", "deployed", "job_end", "cleaned"]
+
+
+def test_wandb_rows_chart_live_metrics_by_time_and_step_metrics_by_step():
+    from async_grpo_tool_use.dashboard.wandb_log import row
+
+    gpu = {"type": "metric", "k": "gpu", "t": 110.0, "ts": 1.0, "util": [80, 60], "mem_mib": [1, 3]}
+    assert row(gpu, 100.0) == {"live/elapsed_s": 10.0, "live/gpu_util_avg": 70.0, "live/gpu_mem_mib_avg": 2.0}
+    sbx = {"type": "metric", "k": "sandboxes", "t": 100.0, "total": 3, "states": {"running": 2, "pending": 1}}
+    assert row(sbx, 100.0) == {"live/elapsed_s": 0.0, "live/sandboxes_total": 3,
+                               "live/sandboxes_states_running": 2, "live/sandboxes_states_pending": 1}  # fmt: skip
+    step = {"type": "step_done", "step": 2, "metrics": {"off_policy": 1.5}, "timings": {"generation": 9.0}}
+    assert row(step, 0) == {"step/step": 2, "step/off_policy": 1.5, "step/time_generation": 9.0}
+    assert row({"type": "metric", "k": "example", "t": 1, "prompt": "x"}, 0) is None

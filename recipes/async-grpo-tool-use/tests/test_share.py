@@ -137,11 +137,13 @@ def test_relay_sends_backlog_then_live_events_scrubbed_and_retries():
 
 def test_run_links_point_at_the_run_in_forge():
     env = {"WANDB_API_KEY": "k", "WANDB_ENTITY": "my-team", "WANDB_PROJECT": "async-grpo-tool-use"}
-    wandb, traces, evals = run.run_links(env, "async-grpo-1")
+    wandb, page_metrics, traces, evals = run.run_links(env, "async-grpo-1")
     project = "https://forge.coreweave.com/wandb/my-team/async-grpo-tool-use"
     assert wandb == {"label": "W&B run", "url": f"{project}/runs/async-grpo-1"}
+    assert page_metrics["url"] == f"{project}/runs/async-grpo-1-dashboard"  # what the page draws, in W&B
     assert traces["url"] == f"{project}/weave/agents" and evals["url"] == f"{project}/weave/evaluations"
-    assert all(link["url"].startswith(share.LINK_HOSTS) for link in (wandb, traces, evals))  # viewers see them
+    links = (wandb, page_metrics, traces, evals)
+    assert all(link["url"].startswith(share.LINK_HOSTS) for link in links)  # viewers see them
 
 
 def test_no_links_without_a_wandb_key():

@@ -345,3 +345,34 @@ def test_uploads_use_larger_parts_and_everything_else_passes_through(weight_sync
     assert args == ("f", "b", "k") and kwargs["ExtraArgs"] == {"Metadata": {"cwtrain-sha256": "x"}}
     assert (kwargs["Config"].multipart_chunksize, kwargs["Config"].max_concurrency) == (32 * 2**20, 16)
     assert s3.head_object(Bucket="b") == "head"
+
+
+def test_gpu_sandbox_sampler_gets_each_export_through_the_bucket(weight_sync, monkeypatch, tmp_path):
+    """target=vllm, transfer=bucket: upload, ask the sampler to load it, then drop the previous one."""
+    from async_grpo_tool_use import sampler
+
+    log: list = []
+    monkeypatch.setenv("HOTLOAD_BUCKET", "bucket")
+    monkeypatch.setattr(weight_sync, "checkpoint_dtypes", lambda base: {"a": "BF16"})
+    monkeypatch.setattr(weight_sync, "checkpoint_sizes", lambda base: {"a": 2})
+    monkeypatch.setattr(weight_sync, "add_model_files", lambda base, path: None)
+    monkeypatch.setattr(weight_sync.caios, "client", lambda: "s3")
+    monkeypatch.setattr(weight_sync.caios, "upload_dir",
+                        lambda s3, path, bucket, prefix, marker: log.append(("upload", bucket, prefix)))  # fmt: skip
+    monkeypatch.setattr(weight_sync.caios, "delete_prefix", lambda s3, bucket, prefix: log.append(("delete", prefix)))
+    monkeypatch.setattr(sampler.SamplerClient, "load",
+                        lambda self, **query: log.append(("load", query)) or {"paused_s": 1.0, "download_s": 2.0})  # fmt: skip
+    cfg = {"target": "vllm", "sampler_urls": "http://127.0.0.1:21200,http://127.0.0.1:21201", "transfer": "bucket", "weights_prefix": "w/",
+           "run_id": "run", "max_versions_behind": 0}  # fmt: skip
+    sync = weight_sync.HotLoadWeightSynchronizer(
+        FakePolicy(log), types.SimpleNamespace(hotload_cfg=cfg), hf_checkpoint="/base", export_dir=str(tmp_path),
+        async_grpo=True,
+    )  # fmt: skip
+    sync.sync_weights()
+    sync.sync_weights()
+    sync.shutdown()
+    assert [e for e in log if e[0] != "export"] == [
+        ("upload", "bucket", "w/v000001"), *[("load", {"s3": "w/v000001", "version": 1})] * 2,  # both samplers
+        ("upload", "bucket", "w/v000002"), *[("load", {"s3": "w/v000002", "version": 2})] * 2, ("delete", "w/v000001"),
+    ]  # fmt: skip
+    assert not any(tmp_path.iterdir())

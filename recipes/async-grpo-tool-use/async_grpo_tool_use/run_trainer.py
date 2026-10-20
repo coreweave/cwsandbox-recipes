@@ -1,12 +1,14 @@
-"""Entrypoint of the trainer step on SUNK: patch NeMo-RL, stage the model, calibrate, run GRPO.
+"""Entrypoint of the trainer, in a Slurm job step or a GPU sandbox: patch NeMo-RL, stage the
+model, calibrate, run GRPO.
 
 1. Patch NeMo-RL and download the model.
-2. Upload the model to object storage (once, cached) and copy it to this run's prefix. The
-   launcher then creates the inference deployment from that copy.
-3. Prepare the data and run the verifier calibration while the deployment starts.
-4. Wait for the deployment, then run GRPO. Rollouts come from Gym and the deployment.
+2. With Dedicated Inference (``SAMPLER=di``): upload the model to object storage (once, cached)
+   and copy it to this run's prefix. The launcher then creates the inference deployment from
+   that copy. The self-hosted sampler (``SAMPLER=vllm``) downloads the model itself.
+3. Prepare the data and run the verifier calibration while the sampler starts.
+4. Wait for the sampler, then run GRPO. Rollouts come from Gym and the sampler.
 
-Arguments are extra Hydra overrides for NeMo-RL. ``/job`` is the run directory on SUNK.
+Arguments are extra Hydra overrides for NeMo-RL. ``/job`` is the run directory.
 
 Usage: /opt/nemo_rl_venv/bin/python -m async_grpo_tool_use.run_trainer [hydra overrides...]
 """
@@ -33,6 +35,7 @@ from async_grpo_tool_use.procs import (
     wait_http,
 )
 from async_grpo_tool_use.run_gym import EVAL_AGENT_PORT, EVAL_SERVER_PORT, TRAIN_AGENT_PORT
+from async_grpo_tool_use.sunk_job import report_gpus
 
 WORKSPACE = Path("/workspace")
 NEMO_RL_DIR = Path(os.environ.get("NEMO_RL_DIR", "/opt/nemo-rl"))
@@ -117,12 +120,17 @@ def main(argv: list[str]) -> int:
     require("COREWEAVE_API_TOKEN")
     os.environ["PYTHONUNBUFFERED"] = "1"
 
+    if os.environ.get("DASHBOARD_METRICS") == "1":
+        report_gpus()
+    dedicated_inference = os.environ.get("SAMPLER", "di") == "di"
     log(f"trainer: patching NeMo-RL in {NEMO_RL_DIR}")
-    install_cwtrain()
+    if os.environ.get("HOTLOAD_BUCKET"):  # weights go through object storage, with cwtrain's client
+        install_cwtrain()
     apply_patches()
     expose_recipe_to_worker_venvs()
     model_prep.prepare(require("MODEL_REPO"), require("MODEL_REVISION"), MODEL_DIR)
-    stage_model()
+    if dedicated_inference:
+        stage_model()
     max_samples = int(os.environ["DAPO_MAX_SAMPLES"]) if os.environ.get("DAPO_MAX_SAMPLES") else None
     train_data, eval_data = dapo_data.prepare(DATA_DIR, max_samples)
 
@@ -138,7 +146,7 @@ def main(argv: list[str]) -> int:
         wait_http(name, url + "/", ok=lambda s: 200 <= s < 500)
     run_calibration(train_data, eval_data)
 
-    log("trainer: waiting for the inference deployment")
+    log("trainer: waiting for the sampler")
     os.environ.update(read_env_file(wait_for_file(JOB_DIR / "inference.env")))
     log(f"trainer: starting async GRPO on {gpu_count()} GPUs, rollouts from {require('INFERENCE_BASE_URL')}")
     if os.environ.get("WANDB_API_KEY"):

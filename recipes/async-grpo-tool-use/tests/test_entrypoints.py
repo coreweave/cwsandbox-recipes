@@ -3,6 +3,8 @@
 import sys
 import time
 
+import yaml
+
 from async_grpo_tool_use import procs, run_gym, run_trainer
 
 
@@ -26,7 +28,9 @@ def test_http_status_is_zero_when_nothing_listens():
 
 def test_gym_overlay_binds_localhost_outside_nemo_rl_ports():
     text = run_gym.overrides_yaml("https://gw.example/v1", "async-grpo-1", "Qwen/Qwen2.5-Math-7B", "abc")
-    assert "policy_base_url: https://gw.example/v1" in text and "policy_model_name: async-grpo-1" in text
+    assert "policy_base_url: [https://gw.example/v1]" in text and "policy_model_name: async-grpo-1" in text
+    two = yaml.safe_load(run_gym.overrides_yaml("http://127.0.0.1:21100/v1,http://127.0.0.1:21101/v1", "m", "t", "r"))
+    assert two["policy_base_url"] == ["http://127.0.0.1:21100/v1", "http://127.0.0.1:21101/v1"]  # one per sampler
     assert "policy_api_key: ${oc.env:COREWEAVE_API_TOKEN}" in text  # the token stays out of the file
     assert "entrypoint: token_ids_app.py" in text and "tokenizer_revision: abc" in text
     ports = (run_gym.HEAD_PORT, run_gym.TRAIN_AGENT_PORT, run_gym.EVAL_AGENT_PORT, run_gym.EVAL_SERVER_PORT)

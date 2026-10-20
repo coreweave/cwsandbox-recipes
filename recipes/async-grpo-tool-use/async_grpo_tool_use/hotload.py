@@ -14,25 +14,34 @@ import struct
 from pathlib import Path
 
 
+def _read_header(shard: Path) -> dict[str, dict]:
+    with open(shard, "rb") as fh:
+        (size,) = struct.unpack("<Q", fh.read(8))
+        header = json.loads(fh.read(size))
+    header.pop("__metadata__", None)
+    return header
+
+
 def _headers(checkpoint: Path) -> dict[str, dict]:
-    """Tensor name -> safetensors header entry for every tensor the checkpoint's index lists."""
-    index = json.loads((checkpoint / "model.safetensors.index.json").read_text())
+    """Tensor name -> safetensors header entry for every tensor in the checkpoint: the tensors its
+    index lists, or those of its single ``model.safetensors`` (small models have no index)."""
+    index_file = checkpoint / "model.safetensors.index.json"
+    if not index_file.exists():
+        return _read_header(checkpoint / "model.safetensors")
+    weight_map = json.loads(index_file.read_text())["weight_map"]
     headers: dict[str, dict] = {}
-    for shard in sorted(set(index["weight_map"].values())):
-        with open(checkpoint / shard, "rb") as fh:
-            (size,) = struct.unpack("<Q", fh.read(8))
-            header = json.loads(fh.read(size))
-        for name, info in header.items():
-            if name != "__metadata__" and name in index["weight_map"]:
+    for shard in sorted(set(weight_map.values())):
+        for name, info in _read_header(checkpoint / shard).items():
+            if name in weight_map:
                 headers[name] = info
-    missing = set(index["weight_map"]) - set(headers)
+    missing = set(weight_map) - set(headers)
     if missing:
         raise ValueError(f"{len(missing)} indexed tensors are not in any shard header")
     return headers
 
 
 def checkpoint_dtypes(checkpoint: Path) -> dict[str, str]:
-    """Tensor name -> safetensors dtype for every tensor the checkpoint's index lists."""
+    """Tensor name -> safetensors dtype for every tensor in the checkpoint."""
     return {name: info["dtype"] for name, info in _headers(checkpoint).items()}
 
 

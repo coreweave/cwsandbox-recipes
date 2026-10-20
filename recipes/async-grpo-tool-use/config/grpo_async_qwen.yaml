@@ -86,15 +86,19 @@ policy:
     stop_strings: null
     colocated:
       enabled: false
-      # GPUs of the deployment (2 replicas x 1 GPU); used only for throughput metrics.
+      # GPUs of the sampler; used only for throughput metrics.
       resources:
-        gpus_per_node: 2
+        gpus_per_node: ${oc.env:SAMPLER_GPUS,2}
         num_nodes: 1
-    # Set by run_trainer from the deployment that the launcher created.
+    # Set by run_trainer from the sampler that the launcher started.
     hotload_cfg:
-      base_url: ${oc.env:INFERENCE_BASE_URL}  # https://<gateway>/v1
+      target: ${oc.env:SAMPLER,di}  # di: Dedicated Inference; vllm: async_grpo_tool_use.sampler
+      base_url: ${oc.env:INFERENCE_BASE_URL}  # https://<gateway>/v1, or the sampler's vLLM
       model: ${oc.env:INFERENCE_MODEL}
-      deployment_id: ${oc.env:HOTLOAD_DEPLOYMENT_ID}
+      deployment_id: ${oc.env:HOTLOAD_DEPLOYMENT_ID,""}
+      sampler_urls: ${oc.env:SAMPLER_URLS,""}  # the samplers' weight receivers, comma-separated
+      transfer: ${oc.env:SAMPLER_TRANSFER,shared}  # shared: loaded in place (Slurm); bucket: through object storage
+      weights_prefix: ${oc.env:SAMPLER_WEIGHTS_PREFIX,""}  # bucket transfer: exports go under it
       run_id: ${oc.env:RUN_TAG}  # hot-load identities are <run_id>-v000001, ...
       token_env: COREWEAVE_API_TOKEN
       max_model_len: ${policy.max_total_sequence_length}
@@ -139,5 +143,5 @@ logger:
     name: ${oc.env:RUN_TAG}  # also the run id (WANDB_RUN_ID), so the dashboard can link it
 
 cluster:
-  gpus_per_node: 8
+  gpus_per_node: ${oc.env:TRAINER_GPUS,8}
   num_nodes: 1

@@ -1,13 +1,27 @@
-"""Start a training run: NeMo-RL on SUNK, rollouts from CoreWeave Dedicated Inference,
-NeMo-Gym in a CoreWeave CPU sandbox.
+"""Start a training run: NeMo-RL trainer, a sampler, and NeMo-Gym in a CoreWeave CPU sandbox.
 
-1. Create a temporary object storage key (``cwic``) and an inference gateway (``cwtrain``).
+Where the trainer runs (``TRAINER``):
+
+* ``sunk`` (default): a Slurm job on one 8-GPU node of SUNK, or of any Slurm cluster with pyxis
+  that you reach over ssh.
+* ``sandbox``: a CoreWeave GPU sandbox with one GPU, for small models.
+
+Where rollouts are sampled (``SAMPLER``):
+
+* ``di`` (default, ``TRAINER=sunk`` only): a CoreWeave Dedicated Inference hot-load deployment.
+* ``vllm``: the self-hosted vLLM of ``async_grpo_tool_use.sampler``, on part of the trainer's
+  node (``TRAINER=sunk``) or in a second one-GPU sandbox (``TRAINER=sandbox``).
+
+1. With ``SAMPLER=di``: create a temporary object storage key (``cwic``) and an inference
+   gateway (``cwtrain``). With ``TRAINER=sandbox``: create the storage key only; the weights go
+   from the trainer sandbox to the sampler sandbox through the bucket.
 2. Start the Gym sandbox. It serves its agent ports through a Tailcat tunnel.
-3. Copy the recipe to SUNK and submit a Slurm job (``sunk_job``). The trainer stages the base
-   model in the bucket.
-4. Create a hot-load deployment of the staged model behind the gateway and wait until it serves.
-   Pass its endpoint to the trainer and to Gym.
-5. Stream the Slurm job log until the job ends. Then delete everything the run created.
+3. Start the trainer: copy the recipe to SUNK and submit a Slurm job (``sunk_job``), or start the
+   trainer sandbox (``trainer_sandbox``) and, for its sampler, the sampler sandbox.
+4. With ``SAMPLER=di``: once the trainer has staged the base model in the bucket, create a
+   hot-load deployment of it behind the gateway and wait until it serves. With ``SAMPLER=vllm``:
+   wait for the sampler's tunnel address. Pass the sampler to the trainer and to Gym.
+5. Stream the trainer's log until it ends. Then delete everything the run created.
 
 Usage: python -m async_grpo_tool_use.launch [--max-num-steps N] [-- hydra overrides...]
 """
@@ -32,12 +46,19 @@ from typing import Any, Callable
 from async_grpo_tool_use.dapo_data import AIME_PROBLEMS, EVAL_REPEATS
 from async_grpo_tool_use.inference import DeploymentSettings, Inference, deployment_spec
 from async_grpo_tool_use.sunk import Sunk
+from async_grpo_tool_use.trainer_sandbox import EXIT_LINE
 
 RECIPE_TAG = "async-grpo"
 WORKSPACE = "/workspace"
 GYM_IMAGE = "python:3.13.16"
+# The image sunk_job imports on Slurm, as a registry reference for sandboxes.
+TRAINER_IMAGE = "nvcr.io/nvidia/nemo-rl@sha256:75c4821c7f24d6a045d22ce51756bd7ea9ec208020c90233723b9d7a9727d681"
 MODEL_REPO = "Qwen/Qwen2.5-Math-7B"
 MODEL_REVISION = "b101308fe89651ea5ce025f25317fea6fc07e96e"
+# The default with TRAINER=sandbox: it trains on one GPU, and vLLM serves it on another.
+SMALL_MODEL_REPO = "Qwen/Qwen2.5-Math-1.5B"
+SMALL_MODEL_REVISION = "4a83ca6e4526a4f2da3aa259ec36c259f66b2ab2"
+GPU_SANDBOX_TYPE = "rtxp6000-8x"  # serverless GPU sandboxes: RTX PRO 6000 Blackwell, 96 GB
 MOUNT_DIRS = ("async_grpo_tool_use/", "config/", "patches/", "gym_env/")
 WANDB_PROJECT = "async-grpo-tool-use"
 # Copied from the host environment to the SUNK job when set.
@@ -82,11 +103,21 @@ def stop_tagged(sdk: Any, tag: str, attempts: int = 3) -> int:
 
 @dataclass(frozen=True)
 class LaunchConfig:
-    runner_id: str  # CoreWeave sandbox runner for the Gym sandbox
+    runner_id: str  # CoreWeave sandbox runner for the Gym sandbox; empty: serverless
     api_token: str  # CoreWeave API token: sandboxes, inference requests and hot-loads
-    sunk: Sunk
+    sunk: Sunk | None  # None with TRAINER=sandbox
     sunk_dir: str  # e.g. /mnt/data/<you>/async-grpo-tool-use; holds runs/ and cache/
     project_root: Path
+    trainer: str = "sunk"  # sunk or sandbox
+    sampler: str = "di"  # di or vllm
+    model_repo: str = MODEL_REPO
+    model_revision: str = MODEL_REVISION
+    gpu_type: str = GPU_SANDBOX_TYPE
+    trainer_cpu: str = "16"
+    trainer_memory: str = "40Gi"
+    sampler_cpu: str = "8"
+    sampler_replicas: int = 1  # sampler sandboxes, one GPU each (TRAINER=sandbox)
+    sampler_memory: str = "32Gi"
     bucket: str = "gradient-hotloading"
     bucket_prefix: str = "cookbook/async-grpo-tool-use"  # the inference service must be able to read it
     deployment: DeploymentSettings = field(default_factory=DeploymentSettings)
@@ -139,8 +170,19 @@ def create_with_retry(create: Callable[[], Any], what: str, timeout: float = 900
             capacity = any(word in type(exc).__name__ for word in ("Unavailable", "ResourceExhausted"))
             if not capacity or time.monotonic() > deadline:
                 raise
-            log(f"{what}: no capacity on the runner yet; retrying")
+            log(f"{what}: no capacity yet; retrying")
         time.sleep(20)
+
+
+def sandbox_alive(sandbox: Any) -> bool:
+    """False once the sandbox stopped or its container restarted (a restart loses the
+    tunnel and the endpoint file, so the run cannot recover)."""
+    try:
+        status = str(sandbox.get_status()).lower()
+        restarts = sum(c.restart_count or 0 for c in sandbox.container_statuses or ())
+    except Exception:  # noqa: BLE001 - a failed status call does not mean the sandbox stopped
+        return True
+    return restarts == 0 and any(state in status for state in ("running", "creating", "pending", "starting"))
 
 
 def check_write(s3: Any, bucket: str, prefix: str) -> None:
@@ -183,8 +225,13 @@ class Launcher:
         self.run_tag = f"{RECIPE_TAG}-{uuid.uuid4().hex[:8]}"
         self.run_dir = f"{config.sunk_dir}/runs/{self.run_tag}"
         self.run_prefix = f"{config.bucket_prefix}/runs/{self.run_tag}"
-        self.model_cache_prefix = f"{config.bucket_prefix}/models/{MODEL_REPO.split('/')[-1]}-{MODEL_REVISION[:8]}"
+        model = f"{config.model_repo.split('/')[-1]}-{config.model_revision[:8]}"
+        self.model_cache_prefix = f"{config.bucket_prefix}/models/{model}"
         self.gym: Any = None
+        self.trainer: Any = None  # the trainer sandbox (TRAINER=sandbox)
+        self.trainer_exit: int | None = None  # from the trainer sandbox's last log line
+        self.samplers: list[Any] = []  # the sampler sandboxes (TRAINER=sandbox), SAMPLER_REPLICAS of them
+        self.sampler_gpus = 0  # GPUs of the self-hosted sampler, once it serves
         self.job_id: str | None = None
         self.tail: Any = None
         self.access_key: dict[str, str] | None = None
@@ -236,8 +283,8 @@ class Launcher:
         env = {
             "PYTHONPATH": WORKSPACE,
             "RUN_TAG": self.run_tag,
-            "MODEL_REPO": MODEL_REPO,  # Gym's model server tokenizes with the model's tokenizer
-            "MODEL_REVISION": MODEL_REVISION,
+            "MODEL_REPO": self.config.model_repo,  # Gym's model server tokenizes with the model's tokenizer
+            "MODEL_REVISION": self.config.model_revision,
             "COREWEAVE_API_TOKEN": self.config.api_token,  # for the inference gateway
             # Gym's episode server creates the rollout sandboxes.
             "CWSANDBOX_API_KEY": self.config.api_token,
@@ -255,9 +302,7 @@ class Launcher:
                 environment_variables=env,
                 max_lifetime_seconds=self.config.max_lifetime_seconds,
                 tags=[RECIPE_TAG, self.run_tag, f"{RECIPE_TAG}-gym"],
-                placement_mode="cks",
-                placement_spillover="strict",
-                runner_ids=[self.config.runner_id],
+                **gym_placement(self.config.runner_id),
             ),
             "gym",
         )
@@ -265,48 +310,101 @@ class Launcher:
         return self.gym
 
     def gym_alive(self) -> bool:
-        """False once the sandbox stopped or its container restarted (a restart loses the
-        tunnel and the endpoint file, so the run cannot recover)."""
-        try:
-            status = str(self.gym.get_status()).lower()
-            restarts = sum(c.restart_count or 0 for c in self.gym.container_statuses or ())
-        except Exception:  # noqa: BLE001 - a failed status call does not mean the sandbox stopped
-            return True
-        return restarts == 0 and any(state in status for state in ("running", "creating", "pending", "starting"))
+        return sandbox_alive(self.gym)
 
     def stream_gym_log(self) -> None:
-        """Print the Gym sandbox's output with a ``[gym]`` prefix, without package install lines."""
+        self.stream_sandbox_log(self.gym, "[gym] ")
+
+    def stream_sandbox_log(self, sandbox: Any, prefix: str) -> None:
+        """Print a sandbox's output with ``prefix``, without package install lines."""
         noise = re.compile(
             r"^(\(\w+\) )?\s*[+-] \S+==|^(\(\w+\) )?(Resolved|Prepared|Installed|Uninstalled|Audited|Checked) "
         )
 
         def pump() -> None:
             try:
-                for line in self.gym.stream_logs(follow=True):
+                for line in sandbox.stream_logs(follow=True):
                     if not noise.search(line):
-                        self.sink(f"[gym] {line}" if line.endswith("\n") else f"[gym] {line}\n")
+                        self.sink(f"{prefix}{line}" if line.endswith("\n") else f"{prefix}{line}\n")
+                    if sandbox is self.trainer and EXIT_LINE in line:
+                        self.trainer_exit = int(line.rsplit(EXIT_LINE, 1)[1].strip())
             except Exception:  # noqa: BLE001 - the stream ends when the sandbox stops
                 pass
 
         threading.Thread(target=pump, daemon=True).start()
 
-    # ------------------------------------------------------------------ sunk job
+    # ------------------------------------------------------------------ GPU sandboxes
 
-    def secrets_env(self) -> bytes:
+    def start_gpu_sandbox(self, role: str, module: str, args: list[str], cpu: str, memory: str) -> Any:
+        """A serverless sandbox with one GPU on the NeMo-RL image, running ``module``."""
+        limits = {"cpu": cpu, "memory": memory}
+        env = {**self.trainer_env(), "PYTHONPATH": WORKSPACE, "PYTHONUNBUFFERED": "1"}
+        sandbox = create_with_retry(
+            lambda: self.sdk.Sandbox.run(
+                "/opt/nemo_rl_venv/bin/python",
+                "-m",
+                module,
+                *args,
+                container_image=TRAINER_IMAGE,
+                resources={"requests": limits, "limits": limits, "gpu": {"count": 1, "type": self.config.gpu_type}},
+                mounted_files=collect_mounted_files(self.config.project_root),
+                environment_variables=env,
+                max_lifetime_seconds=self.config.max_lifetime_seconds,
+                tags=[RECIPE_TAG, self.run_tag, f"{RECIPE_TAG}-{role}"],
+                placement_mode="serverless",
+            ),  # fmt: skip
+            f"{role} GPU sandbox",
+            timeout=3600,
+        )
+        log(f"{role}: sandbox {sandbox.sandbox_id} requested (1 GPU)")
+        return sandbox
+
+    def sampler_env(self, addresses: list[str]) -> bytes:
+        """What the trainer and Gym need to reach the self-hosted samplers through the tunnel:
+        replica ``i`` is local at ports ``VLLM_PORT + i`` and ``RECEIVER_PORT + i``."""
+        from async_grpo_tool_use.sampler import RECEIVER_PORT, SERVED_MODEL, VLLM_PORT
+
+        replicas = range(len(addresses))
         values = {
-            "RUN_TAG": self.run_tag,
-            "MODEL_REPO": MODEL_REPO,
-            "MODEL_REVISION": MODEL_REVISION,
-            "COREWEAVE_API_TOKEN": self.config.api_token,
-            "AWS_ACCESS_KEY_ID": self.access_key["accessKeyID"],
-            "AWS_SECRET_ACCESS_KEY": self.access_key["secretKey"],
-            "AWS_REGION": self.bucket_zone,
-            "HOTLOAD_BUCKET": self.config.bucket,
-            "MODEL_CACHE_PREFIX": self.model_cache_prefix,
-            "MODEL_RUN_PREFIX": f"{self.run_prefix}/base",
-            **self.config.env,
+            "INFERENCE_BASE_URL": f"http://127.0.0.1:{VLLM_PORT}/v1",
+            "INFERENCE_BASE_URLS": ",".join(f"http://127.0.0.1:{VLLM_PORT + i}/v1" for i in replicas),
+            "INFERENCE_MODEL": SERVED_MODEL,
+            "SAMPLER_ADDRS": ",".join(addresses),
+            "SAMPLER_URLS": ",".join(f"http://127.0.0.1:{RECEIVER_PORT + i}" for i in replicas),
+            # On Slurm the sampler is a step on the trainer's node and loads each export in place.
+            # GPU sandboxes send them through object storage.
+            "SAMPLER_TRANSFER": "shared" if self.config.trainer == "sunk" else "bucket",
         }
         return "".join(f"{key}={value}\n" for key, value in values.items()).encode()
+
+    # ------------------------------------------------------------------ sunk job
+
+    def trainer_env(self) -> dict[str, str]:
+        values = {
+            "RUN_TAG": self.run_tag,
+            "MODEL_REPO": self.config.model_repo,
+            "MODEL_REVISION": self.config.model_revision,
+            "COREWEAVE_API_TOKEN": self.config.api_token,
+            "SAMPLER": self.config.sampler,
+            **self.config.env,
+        }
+        if "WANDB_API_KEY" in values:  # the dashboard's own W&B run joins this group
+            values["WANDB_RUN_GROUP"] = self.run_tag
+        if self.access_key:  # the trainer uploads the weights; the sandbox sampler downloads them
+            values.update({
+                "AWS_ACCESS_KEY_ID": self.access_key["accessKeyID"],
+                "AWS_SECRET_ACCESS_KEY": self.access_key["secretKey"],
+                "AWS_REGION": self.bucket_zone,
+                "HOTLOAD_BUCKET": self.config.bucket,
+            })  # fmt: skip
+        if self.config.sampler == "di":  # the trainer stages the model for the deployment
+            values.update(MODEL_CACHE_PREFIX=self.model_cache_prefix, MODEL_RUN_PREFIX=f"{self.run_prefix}/base")
+        elif self.config.trainer == "sandbox":
+            values.update(SAMPLER_WEIGHTS_PREFIX=f"{self.run_prefix}/weights")
+        return values
+
+    def secrets_env(self) -> bytes:
+        return "".join(f"{key}={value}\n" for key, value in self.trainer_env().items()).encode()
 
     def submit_job(self, gym_address: str) -> str:
         sunk, run_dir = self.sunk, self.run_dir
@@ -336,10 +434,19 @@ class Launcher:
         threading.Thread(target=pump, daemon=True).start()
 
     def check_peers(self) -> str:
-        """Raise ``PeerStopped`` if the job or the Gym sandbox ended. Return the job state."""
-        state = self.sunk.state(self.job_id)
-        if state not in ACTIVE_STATES:
-            raise PeerStopped(f"sunk: job {self.job_id} {state}")
+        """Raise ``PeerStopped`` if the trainer, a sampler sandbox or the Gym sandbox ended.
+        Return the trainer's state."""
+        if self.trainer is not None:
+            state = "RUNNING" if sandbox_alive(self.trainer) else "STOPPED"
+            if state == "STOPPED":
+                raise PeerStopped("the trainer sandbox stopped")
+        else:
+            state = self.sunk.state(self.job_id)
+            if state not in ACTIVE_STATES:
+                raise PeerStopped(f"sunk: job {self.job_id} {state}")
+        for replica, sampler in enumerate(self.samplers):
+            if not sandbox_alive(sampler):
+                raise PeerStopped(f"sampler-{replica} stopped or restarted; see the [sampler-{replica}] lines")
         if not self.gym_alive():
             raise PeerStopped("the Gym sandbox stopped or restarted; see the [gym] lines")
         return state
@@ -352,10 +459,26 @@ class Launcher:
         return retry(read, what, timeout=4 * 3600, every=20)
 
     def follow_job(self) -> int:
-        """Wait until the job ends. Return its exit code."""
+        """Wait until the trainer ends. Return its exit code."""
         deadline = time.monotonic() + self.config.max_lifetime_seconds + 600
         while True:
             time.sleep(30)
+            if self.trainer is not None:
+                if not sandbox_alive(self.trainer):
+                    # The exit code can be recorded a few seconds after the terminal status.
+                    code = None
+                    for _ in range(6):
+                        time.sleep(5)
+                        code = self.trainer.returncode
+                        if code is not None:
+                            break
+                    if code is None:
+                        code = self.trainer_exit
+                    status = self.trainer.get_status()
+                    log(f"trainer: sandbox {str(getattr(status, 'value', status)).lower()}, exit code {code}")
+                    return 1 if code is None else code
+                self.check_peers()
+                continue
             try:
                 self.check_peers()
             except PeerStopped:
@@ -372,8 +495,10 @@ class Launcher:
 
     def start(self) -> None:
         log(f"run tag {self.run_tag}")
-        self.create_storage_key()
-        self.create_gateway()
+        if self.config.sampler == "di" or self.config.trainer == "sandbox":
+            self.create_storage_key()
+        if self.config.sampler == "di":
+            self.create_gateway()
         gym = self.start_gym()
         gym.wait(timeout=1800)
         self.stream_gym_log()
@@ -384,13 +509,52 @@ class Launcher:
             return gym.read_file(f"{WORKSPACE}/run/gym.addr").result().decode().strip() or None
 
         gym_address = retry(read_gym_address, "the Gym tunnel address")
-        self.submit_job(gym_address)
-        self.stream_log()
-        self.wait_for_sunk_file("model.staged", "the trainer to stage the model (the job may be waiting for a node)")
-        self.create_deployment()
-        env = self.inference_env()
-        self.sunk.write_private(f"{self.run_dir}/inference.env", env)
+        if self.config.trainer == "sandbox":
+            self.start_sandbox_trainer(gym_address)
+            addresses = [self.read_sandbox_file(sampler, "sampler.addr", f"sampler-{replica}'s tunnel address")
+                         for replica, sampler in enumerate(self.samplers)]  # fmt: skip
+            env = self.sampler_env(addresses)
+            self.trainer.write_file(f"{WORKSPACE}/run/inference.env", env).result()
+        else:
+            self.submit_job(gym_address)
+            self.stream_log()
+            if self.config.sampler == "di":
+                self.wait_for_sunk_file(
+                    "model.staged", "the trainer to stage the model (the job may be waiting for a node)"
+                )
+                self.create_deployment()
+                env = self.inference_env()
+            else:
+                env = self.sampler_env([self.wait_for_sunk_file("sampler.addr", "the sampler step's tunnel address")])
+            self.sunk.write_private(f"{self.run_dir}/inference.env", env)
         gym.write_file(f"{WORKSPACE}/run/inference.env", env).result()
+        if self.config.sampler == "vllm":
+            self.sampler_gpus = int(self.config.env["SAMPLER_GPUS"]) * self.config.sampler_replicas
+        log("sampler: passed to the trainer and to Gym")
+
+    def start_sandbox_trainer(self, gym_address: str) -> None:
+        """Start the sampler and the trainer sandboxes together: they all pull the NeMo-RL image."""
+        self.samplers = [
+            self.start_gpu_sandbox(f"sampler-{replica}", "async_grpo_tool_use.sampler", [f"{WORKSPACE}/run"],
+                                   self.config.sampler_cpu, self.config.sampler_memory)
+            for replica in range(self.config.sampler_replicas)
+        ]  # fmt: skip
+        self.trainer = self.start_gpu_sandbox("trainer", "async_grpo_tool_use.trainer_sandbox",
+                                              list(self.config.hydra_overrides), self.config.trainer_cpu,
+                                              self.config.trainer_memory)  # fmt: skip
+        self.trainer.wait(timeout=3600)
+        self.trainer.write_file(f"{WORKSPACE}/run/gym.addr", gym_address.encode()).result()
+        self.stream_sandbox_log(self.trainer, "")
+        for replica, sampler in enumerate(self.samplers):
+            sampler.wait(timeout=3600)
+            self.stream_sandbox_log(sampler, f"[sampler-{replica}] ")
+
+    def read_sandbox_file(self, sandbox: Any, name: str, what: str) -> str:
+        def read() -> str | None:
+            self.check_peers()
+            return sandbox.read_file(f"{WORKSPACE}/run/{name}").result().decode().strip() or None
+
+        return retry(read, what, timeout=3600, every=15)
 
     def stop_all(self) -> None:
         """Delete everything the run created. Each step runs even if an earlier one fails."""
@@ -450,6 +614,7 @@ class Launcher:
                 log("storage: access key revoked")
 
             step("revoke the access key", revoke_key, "cwic cwobject access-key list")
+        log("cleanup: done")
 
     def run(self) -> int:
         try:
@@ -491,6 +656,13 @@ def wandb_env(environ: dict[str, str]) -> dict[str, str]:
     }
 
 
+def gym_placement(runner_id: str) -> dict[str, Any]:
+    """The Gym sandbox runs on your runner if you name one, else on serverless capacity."""
+    if not runner_id:
+        return {"placement_mode": "serverless"}
+    return {"placement_mode": "cks", "placement_spillover": "strict", "runner_ids": [runner_id]}
+
+
 def val_period(overrides: tuple[str, ...], config: Path) -> int:
     """``grpo.val_period`` from the Hydra overrides, else from the config file."""
     for override in overrides:
@@ -518,14 +690,42 @@ def config_from_env(args: argparse.Namespace, environ: dict[str, str]) -> Launch
         VAL_PERIOD=str(val_period(tuple(args.overrides), root / "config" / "grpo_async_qwen.yaml")),
         EVAL_ROWS=str(AIME_PROBLEMS * EVAL_REPEATS),
     )
+    trainer, sampler = environ.get("TRAINER", "sunk"), environ.get("SAMPLER", "di")
+    if (trainer, sampler) not in (("sunk", "di"), ("sunk", "vllm"), ("sandbox", "vllm")):
+        raise SystemExit("set TRAINER=sunk with SAMPLER=di or vllm, or TRAINER=sandbox with SAMPLER=vllm")
+    on_slurm = trainer == "sunk"
+    replicas = int(environ.get("SAMPLER_REPLICAS", "1"))
+    if replicas < 1 or (on_slurm and replicas != 1):
+        raise SystemExit("SAMPLER_REPLICAS is the number of sampler GPU sandboxes; it needs TRAINER=sandbox")
+    if sampler == "vllm":
+        # Throughput metrics only; the sampler step takes SAMPLER_GPUS, a sandbox has one GPU.
+        env["SAMPLER_GPUS"] = environ.get("SAMPLER_GPUS", "4") if on_slurm else "1"
+        if on_slurm:
+            env["TRAINER_GPUS"] = str(8 - int(env["SAMPLER_GPUS"]))
+    if not on_slurm:
+        env.update(TRAINER_GPUS="1")
+    runner_id = environ.get("CWSANDBOX_RUNNER_ID", "")
+    if not runner_id and environ.get("SANDBOX_PLACEMENT", "serverless") != "serverless":
+        raise SystemExit("SANDBOX_PLACEMENT=cks or cks_then_serverless needs CWSANDBOX_RUNNER_ID")
+    small = not on_slurm
     defaults = DeploymentSettings()
     return LaunchConfig(
-        runner_id=need("CWSANDBOX_RUNNER_ID"),
+        runner_id=runner_id,
         api_token=need("CWSANDBOX_API_KEY"),
-        sunk=Sunk(host=environ.get("SUNK_SSH_HOST", "sunk"), key=environ.get("SUNK_SSH_KEY") or None),
-        sunk_dir=need("SUNK_DATA_DIR").rstrip("/") + "/async-grpo-tool-use",
+        sunk=Sunk(host=environ.get("SUNK_SSH_HOST", "sunk"), key=environ.get("SUNK_SSH_KEY") or None)
+        if on_slurm
+        else None,
+        sunk_dir=need("SUNK_DATA_DIR").rstrip("/") + "/async-grpo-tool-use" if on_slurm else "",
         project_root=root,
-        bucket=environ.get("HOTLOAD_BUCKET", "gradient-hotloading"),
+        trainer=trainer,
+        sampler=sampler,
+        model_repo=environ.get("MODEL_REPO") or (SMALL_MODEL_REPO if small else MODEL_REPO),
+        model_revision=environ.get("MODEL_REVISION") or (SMALL_MODEL_REVISION if small else MODEL_REVISION),
+        gpu_type=environ.get("GPU_SANDBOX_TYPE", GPU_SANDBOX_TYPE),
+        trainer_memory=environ.get("TRAINER_SANDBOX_MEMORY", "40Gi"),
+        sampler_memory=environ.get("SAMPLER_SANDBOX_MEMORY", "32Gi"),
+        sampler_replicas=replicas,
+        bucket=need("HOTLOAD_BUCKET") if sampler == "di" or not on_slurm else environ.get("HOTLOAD_BUCKET", ""),
         bucket_prefix=environ.get("HOTLOAD_BUCKET_PREFIX", "cookbook/async-grpo-tool-use").strip("/"),
         deployment=DeploymentSettings(
             zone=environ.get("INFERENCE_ZONE", defaults.zone),
@@ -541,7 +741,7 @@ def config_from_env(args: argparse.Namespace, environ: dict[str, str]) -> Launch
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Start an async GRPO run with tool use on SUNK, Dedicated Inference and sandboxes."
+        description="Start an async GRPO run with tool use: a trainer, a sampler and CoreWeave Sandboxes."
     )
     parser.add_argument("--max-num-steps", type=int, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides for NeMo-RL (after --)")

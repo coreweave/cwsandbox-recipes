@@ -21,10 +21,11 @@ def done(value=None):
 class FakeSandbox:
     def __init__(self, kwargs, sandbox_id):
         self.kwargs, self.sandbox_id = kwargs, sandbox_id
-        self.files = {"/workspace/run/gym.addr": b"tcGYM\n"}
+        self.files = {"/workspace/run/gym.addr": b"tcGYM\n", "/workspace/run/sampler.addr": b"tcSAMPLER\n"}
         self.stopped = False
         self.status = "running"
         self.restarts = 0
+        self.returncode = None
 
     def wait(self, timeout=None):
         return self
@@ -87,8 +88,9 @@ class FakeSunk:
     def write_private(self, path, data):
         self.files[path] = data
         self.private.add(path)
-        if path.endswith("gym.addr"):  # the job starts and the trainer stages the model
+        if path.endswith("gym.addr"):  # the job starts: the trainer stages the model, the sampler step serves
             self.files[path.replace("gym.addr", "model.staged")] = b"s3://bucket/base\n"
+            self.files[path.replace("gym.addr", "sampler.addr")] = b"tcSAMPLER\n"
 
     def read(self, path):
         data = self.files.get(path)
@@ -161,12 +163,13 @@ class FakeS3:
         return {}
 
 
-def _launcher(sunk=None):
+def _launcher(sunk=None, **settings):
     environ = {"CWSANDBOX_RUNNER_ID": "my-runner", "CWSANDBOX_API_KEY": "cw-token", "SUNK_DATA_DIR": "/mnt/data/me",
-               "HF_TOKEN": "hf"}  # fmt: skip
+               "HF_TOKEN": "hf", "HOTLOAD_BUCKET": "gradient-hotloading", **settings}  # fmt: skip
     args = argparse.Namespace(max_num_steps=2, overrides=["grpo.seed=1"])
     config = launch.config_from_env(args, environ)
-    config = launch.LaunchConfig(**{**config.__dict__, "sunk": sunk or FakeSunk()})
+    if config.trainer == "sunk":
+        config = launch.LaunchConfig(**{**config.__dict__, "sunk": sunk or FakeSunk()})
     sdk, s3 = FakeSDK(), FakeS3()
     launcher = launch.Launcher(config, sdk, inference=FakeInference(), s3_factory=lambda key, zone: s3,
                                sink=lambda line: None)  # fmt: skip
@@ -342,7 +345,7 @@ def test_stop_tagged_retries_the_sandboxes_whose_stop_failed(monkeypatch):
 def test_wandb_settings_reach_the_trainer_and_gym(monkeypatch):
     monkeypatch.setattr(launch, "wandb_entity", lambda key: "my-team")
     environ = {"CWSANDBOX_RUNNER_ID": "r", "CWSANDBOX_API_KEY": "k", "SUNK_DATA_DIR": "/mnt/data/me",
-               "WANDB_API_KEY": "wk"}  # fmt: skip
+               "WANDB_API_KEY": "wk", "HOTLOAD_BUCKET": "b"}  # fmt: skip
     config = launch.config_from_env(argparse.Namespace(max_num_steps=3, overrides=["grpo.val_period=2"]), environ)
     for env in (config.env, config.gym_env):
         assert env["WANDB_ENTITY"] == "my-team" and env["WANDB_PROJECT"] == "async-grpo-tool-use"
@@ -351,7 +354,82 @@ def test_wandb_settings_reach_the_trainer_and_gym(monkeypatch):
 
 
 def test_no_wandb_key_means_no_wandb_settings():
-    environ = {"CWSANDBOX_RUNNER_ID": "r", "CWSANDBOX_API_KEY": "k", "SUNK_DATA_DIR": "/mnt/data/me"}
+    environ = {
+        "CWSANDBOX_RUNNER_ID": "r",
+        "CWSANDBOX_API_KEY": "k",
+        "SUNK_DATA_DIR": "/mnt/data/me",
+        "HOTLOAD_BUCKET": "b",
+    }
     config = launch.config_from_env(argparse.Namespace(max_num_steps=None, overrides=[]), environ)
     assert "WANDB_API_KEY" not in config.env and "WANDB_API_KEY" not in config.gym_env
     assert config.gym_env["VAL_PERIOD"] == "10" and config.env["MAX_NUM_STEPS"] == "20"
+
+
+def test_gpu_sandboxes_run_trainer_and_sampler_with_weights_through_the_bucket():
+    """TRAINER=sandbox: one GPU sandbox trains, another serves vLLM; no SUNK, gateway or deployment."""
+    launcher, sdk = _launcher(TRAINER="sandbox", SAMPLER="vllm", SAMPLER_REPLICAS="2", SUNK_DATA_DIR="",
+                              CWSANDBOX_RUNNER_ID="")  # fmt: skip
+    real_run = sdk.Sandbox.run
+
+    def run(*command, **kwargs):
+        sandbox = real_run(*command, **kwargs)
+        if "async_grpo_tool_use.trainer_sandbox" in command:  # trains once it has the sampler, then exits 0
+            sandbox.get_status = lambda: "completed" if "/workspace/run/inference.env" in sandbox.files else "running"
+            # The sandbox API reports no exit code; the trainer's last line has it.
+            sandbox.stream_logs = lambda follow: iter(["[grpo] trainer: run_trainer exited with 0\n"])
+        return sandbox
+
+    sdk.Sandbox.run = run
+    assert launcher.run() == 0
+    gym, *samplers, trainer = sdk.created
+    assert gym.kwargs["placement_mode"] == "serverless" and "runner_ids" not in gym.kwargs  # no runner needed
+    assert len(samplers) == 2 and all(s.command[1:3] == ("-m", "async_grpo_tool_use.sampler") for s in samplers)
+    assert trainer.command[1:] == ("-m", "async_grpo_tool_use.trainer_sandbox", "grpo.seed=1")
+    for sandbox in (*samplers, trainer):
+        assert sandbox.kwargs["resources"]["gpu"] == {"count": 1, "type": "rtxp6000-8x"}
+        assert (
+            sandbox.kwargs["placement_mode"] == "serverless"
+            and sandbox.kwargs["container_image"] == launch.TRAINER_IMAGE
+        )
+        assert launcher.run_tag in sandbox.kwargs["tags"]
+    env = trainer.kwargs["environment_variables"]
+    assert env["MODEL_REPO"] == "Qwen/Qwen2.5-Math-1.5B" and env["SAMPLER"] == "vllm" and env["TRAINER_GPUS"] == "1"
+    for sandbox in (*samplers, trainer):  # the trainer uploads each export, each sampler downloads it
+        env = sandbox.kwargs["environment_variables"]
+        assert env["AWS_SECRET_ACCESS_KEY"] == "SK" and env["HOTLOAD_BUCKET"] == "gradient-hotloading"
+        assert env["SAMPLER_WEIGHTS_PREFIX"] == f"cookbook/async-grpo-tool-use/runs/{launcher.run_tag}/weights"
+    assert trainer.files["/workspace/run/gym.addr"] == b"tcGYM"
+    passed = trainer.files["/workspace/run/inference.env"].decode()
+    assert "SAMPLER_ADDRS=tcSAMPLER,tcSAMPLER" in passed and "SAMPLER_TRANSFER=bucket" in passed
+    assert "SAMPLER_URLS=http://127.0.0.1:21200,http://127.0.0.1:21201" in passed
+    assert "INFERENCE_BASE_URLS=http://127.0.0.1:21100/v1,http://127.0.0.1:21101/v1" in passed
+    assert gym.files["/workspace/run/inference.env"].decode() == passed  # Gym samples from it too
+    assert launcher.inference.calls == ["key", ("revoke", "AK")]  # no gateway or deployment
+    assert launcher.fake_s3.deleted  # the run's weights
+    assert all(s.stopped for s in sdk.created)
+
+
+def test_slurm_with_self_hosted_sampler_splits_the_node():
+    launcher, sdk = _launcher(SAMPLER="vllm")
+    sunk, tag = launcher.sunk, launcher.run_tag
+    assert launcher.run() == 0
+    run_dir = f"/mnt/data/me/async-grpo-tool-use/runs/{tag}"
+    secrets = sunk.files[f"{run_dir}/secrets.env"].decode()
+    assert "SAMPLER=vllm" in secrets and "TRAINER_GPUS=4" in secrets and "SAMPLER_GPUS=4" in secrets
+    assert "AWS_SECRET_ACCESS_KEY" not in secrets
+    passed = sunk.files[f"{run_dir}/inference.env"].decode()
+    assert "SAMPLER_ADDRS=tcSAMPLER" in passed and "SAMPLER_TRANSFER=shared" in passed
+    assert launcher.inference.calls == [] and launcher.deployment_id is None
+
+
+def test_unsupported_placements_are_refused():
+    args = argparse.Namespace(max_num_steps=None, overrides=[])
+    base = {"CWSANDBOX_RUNNER_ID": "r", "CWSANDBOX_API_KEY": "k", "SUNK_DATA_DIR": "/d"}
+    with pytest.raises(SystemExit, match="TRAINER=sandbox with SAMPLER=vllm"):
+        launch.config_from_env(args, {**base, "TRAINER": "sandbox"})  # Dedicated Inference from a sandbox
+    with pytest.raises(SystemExit, match="TRAINER=sunk"):
+        launch.config_from_env(args, {**base, "SAMPLER": "sglang"})
+    with pytest.raises(SystemExit, match="SAMPLER_REPLICAS"):  # Slurm runs one sampler step
+        launch.config_from_env(args, {**base, "SAMPLER": "vllm", "SAMPLER_REPLICAS": "2"})
+    with pytest.raises(SystemExit, match="needs CWSANDBOX_RUNNER_ID"):  # rollouts on a runner need one
+        launch.config_from_env(args, {**base, "CWSANDBOX_RUNNER_ID": "", "SANDBOX_PLACEMENT": "cks"})

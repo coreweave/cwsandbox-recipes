@@ -1,12 +1,17 @@
-"""Slurm batch script for SUNK: the NeMo-RL trainer on one 8x H100 node.
+"""Slurm batch script: the NeMo-RL trainer on one 8-GPU node of SUNK or any Slurm cluster
+with pyxis and enroot.
 
 The launcher submits this with ``sbatch``. It runs on the compute node (host Python 3.10):
 
 1. Import the NeMo-RL image into the shared cache (first run only).
 2. Forward the Gym sandbox's agent ports 21002-21004 to 127.0.0.1 here, over a Tailcat tunnel.
-3. Run ``run_trainer`` as a job step in a pyxis container with all 8 GPUs.
+3. Run ``run_trainer`` as a job step in a pyxis container with all 8 GPUs. With the self-hosted
+   sampler (``SAMPLER=vllm``), run ``async_grpo_tool_use.sampler`` as a second step on
+   ``SAMPLER_GPUS`` of them (default 4) and the trainer on the rest. Both steps see the export
+   directory in node memory, so the sampler loads each export in place.
 
-Rollouts come from a Dedicated Inference deployment, which Gym calls over HTTPS.
+Rollouts come from a Dedicated Inference deployment, which Gym calls over HTTPS, or from the
+sampler step, which Gym reaches through its own tunnel.
 
 Usage (from the launcher): sbatch ... --wrap "python3 -m async_grpo_tool_use.sunk_job <run dir>"
 """
@@ -23,7 +28,7 @@ import time
 from pathlib import Path
 
 from async_grpo_tool_use import tunnel
-from async_grpo_tool_use.procs import log, read_env_file, run, spawn, supervise, wait_any, wait_for_file
+from async_grpo_tool_use.procs import gpu_count, log, read_env_file, run, spawn, supervise, wait_any, wait_for_file
 
 TRAINER_IMAGE = "nvcr.io#nvidia/nemo-rl@sha256:75c4821c7f24d6a045d22ce51756bd7ea9ec208020c90233723b9d7a9727d681"
 IMAGE_NAME = "nemo-rl-v0.7.0"
@@ -53,11 +58,13 @@ def import_image(cache: Path) -> Path:
     return final
 
 
-def step(image: Path, mounts: dict[Path, str], command: list[str]) -> list[str]:
-    """An ``srun`` step with all GPUs of the job's node in a pyxis container."""
+def step(
+    image: Path, mounts: dict[Path, str], command: list[str], *, gpus: int = 8, cpus: int = 112, name: str = "trainer"
+) -> list[str]:
+    """An ``srun`` step with ``gpus`` GPUs of the job's node in a pyxis container."""
     mount = ",".join(f"{host}:{inside}" for host, inside in mounts.items())
     return [
-        "srun", "--ntasks=1", "--exact", "--gres=gpu:8", "--cpus-per-task=112", "--job-name=trainer",
+        "srun", "--ntasks=1", "--exact", f"--gres=gpu:{gpus}", f"--cpus-per-task={cpus}", f"--job-name={name}",
         f"--container-image={image}", f"--container-mounts={mount}", "--container-writable", "--no-container-mount-home",
         "--container-workdir=/workspace", *command,
     ]  # fmt: skip
@@ -69,13 +76,14 @@ def refit_dir() -> str:
 
 def report_gpus(every_s: int = 2) -> None:
     """Print one ``@@metric`` line with every GPU's utilization every ``every_s`` seconds, for the
-    live dashboard (``DASHBOARD_METRICS=1``). The job log carries it to the launcher."""
+    live dashboard (``DASHBOARD_METRICS=1``). The trainer calls it, so it sees the trainer's GPUs
+    only; its log carries the lines to the launcher."""
     if not shutil.which("nvidia-smi"):
         return
     query = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,power.draw",
              "--format=csv,noheader,nounits", f"--loop={every_s}"]  # fmt: skip
     smi = subprocess.Popen(query, stdout=subprocess.PIPE, text=True)
-    count = int(os.environ.get("SLURM_GPUS_ON_NODE") or 8)
+    count = gpu_count()
 
     def pump() -> None:
         rows = []
@@ -106,17 +114,28 @@ def main(run_dir: Path, overrides: list[str]) -> int:
     tailcat = tunnel.install(cache / "bin")
     gym_address = wait_for_file(run_dir / "gym.addr").read_text().strip()
     tunnel.forward(tailcat, gym_address, list(GYM_PORTS), run_dir)
-    if os.environ.get("DASHBOARD_METRICS") == "1":
-        report_gpus()
 
     mounts = {run_dir / "code": "/workspace", cache / "work": "/work", run_dir: "/job"}
     # Mounted at the same path, so this script can clean up whatever the container left there.
     refit = Path(os.environ["REFIT_EXPORT_DIR"])
     refit.mkdir(parents=True, exist_ok=True)
     mounts[refit] = str(refit)
-    trainer = spawn(step(image, mounts, [TRAINER_PYTHON, "-m", "async_grpo_tool_use.run_trainer", *overrides]))
+    trainer_command = [TRAINER_PYTHON, "-m", "async_grpo_tool_use.run_trainer", *overrides]
+    if os.environ.get("SAMPLER") != "vllm":
+        steps = [spawn(step(image, mounts, trainer_command))]
+    else:
+        node_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE") or 8)
+        sampler_gpus = int(os.environ.get("SAMPLER_GPUS") or 4)
+        trainer_gpus = node_gpus - sampler_gpus
+        # The trainer downloads the model into /work; the sampler waits for it, then serves it.
+        os.environ.update(TRAINER_GPUS=str(trainer_gpus), SAMPLER_WAIT_FOR_MODEL="1", TAILCAT_DIR="/work/bin")
+        steps = [
+            spawn(step(image, mounts, trainer_command, gpus=trainer_gpus, cpus=56)),
+            spawn(step(image, mounts, [TRAINER_PYTHON, "-m", "async_grpo_tool_use.sampler", "/job"],
+                       gpus=sampler_gpus, cpus=56, name="sampler")),
+        ]  # fmt: skip
     try:
-        return wait_any([trainer])
+        return wait_any(steps)
     finally:
         # A failed run can leave up to three 14 GiB exports in node memory.
         shutil.rmtree(os.environ["REFIT_EXPORT_DIR"], ignore_errors=True)

@@ -42,12 +42,17 @@ STAGES = [
     (re.compile(r"\[grpo\] trainer: model staged"), "staged"),
     (re.compile(r"\[grpo\] inference: deployment (\S+) requested"), "deployment"),
     (re.compile(r"\[grpo\] inference: deployment ready"), "deployed"),
+    # GPU sandboxes and self-hosted samplers: the trainer sandbox runs, the samplers serve.
+    (re.compile(r"\[grpo\] trainer: sandbox (\S+)$"), "node"),
+    (re.compile(r"\[grpo\] sampler-\d+: sandbox (\S+) requested"), "deployment"),
+    (re.compile(r"\[grpo\] sampler: passed to the trainer and to Gym"), "deployed"),
     (re.compile(r"\[math_tir_sandbox\] starting (\d+) episode sandboxes"), "pool"),
     (re.compile(r"\[grpo\] calibration: (\w+)\s+(\d+)% graded"), "calibration"),
     (re.compile(r"\[grpo\] trainer: starting GRPO"), "grpo"),
     (re.compile(r"\[grpo\] sunk: job \S+ (COMPLETED|FAILED|CANCELLED\S*|TIMEOUT)"), "job_end"),
+    (re.compile(r"\[grpo\] trainer: sandbox (\w+), exit code"), "job_end"),
     (re.compile(r"\[grpo\] trainer exited with (\d+)"), "exit"),
-    (re.compile(r"\[grpo\] inference: gateway \S+ deleted"), "cleaned"),
+    (re.compile(r"\[grpo\] cleanup: done"), "cleaned"),
 ]
 STEP = re.compile(r"=+ Step (\d+)/(\d+) =+")
 PHASES = [
@@ -65,6 +70,7 @@ PHASES = [
 HOTLOAD_DONE = re.compile(
     r"\[grpo\] hot-load v(\d+): (\d+) tensors, ([\d.]+) GiB; export (\d+)s, upload and load (\d+)s"
 )
+EXPORTING = re.compile(r"\[grpo\] hot-load v(\d+): exporting weights")
 METRICS = {
     "loss": re.compile(r"• Loss: (-?[\d.]+)"),
     "kl_error": re.compile(r"• Generation KL Error: (-?[\d.]+)"),
@@ -76,6 +82,9 @@ METRICS = {
     "train_tokens_s": re.compile(r"- Training Worker Group \(Tokens/sec\): ([\d.]+)"),
     "gen_tokens_s": re.compile(r"- Generation Worker Group \(Tokens/sec\): ([\d.]+)"),
     "accuracy": re.compile(r"• Accuracy: ([\d.]+)"),
+    # NeMo-RL: steps between the weight version each trained rollout was generated for and the
+    # trainer's. See LineParser.flush_step for the sampler's own lag on top of it.
+    "trajectory_age": re.compile(r"• Avg Trajectory Age: ([\d.]+) steps"),
 }
 TIMING = re.compile(r"• ([\w/]+): ([\d.]+)s \(([\d.]+)%\)")
 VALIDATION_TIME = re.compile(r"• Total validation time: ([\d.]+)s")
@@ -118,6 +127,9 @@ class LineParser:
         self.phase = None
         self.metrics: dict[str, float] = {}
         self.timings: dict[str, float] = {}
+        self.exported = 0  # newest weights version the trainer exported
+        self.serving = 0  # newest version the sampler serves
+        self.lag = 0  # exported - serving when the current step started
 
     def feed(self, raw: str) -> None:
         line = ANSI.sub("", raw).rstrip()
@@ -138,14 +150,19 @@ class LineParser:
         if match:
             self.flush_step()
             self.step = int(match.group(1))
+            self.lag = self.exported - self.serving
             self.hub.publish({"type": "step", "step": self.step, "of": int(match.group(2))})
         for pattern, phase in PHASES:
             if pattern.search(line):
                 self.phase = phase
                 self.hub.publish({"type": "phase", "phase": phase, "step": self.step})
+        match = EXPORTING.search(line)
+        if match:
+            self.exported = int(match.group(1))
         match = HOTLOAD_DONE.search(line)
         if match:
             version, tensors, gib, export_s, load_s = match.groups()
+            self.serving = max(self.serving, int(version))
             self.hub.publish({"type": "hotload", "version": int(version), "gib": float(gib),
                               "export_s": int(export_s), "load_s": int(load_s)})  # fmt: skip
             # A hot-load in the background ends while the trainer is already on the next step.
@@ -168,6 +185,15 @@ class LineParser:
             self.flush_step()  # the last line of a step's summary
 
     def flush_step(self) -> None:
+        """Publish the step's metrics, with how off-policy its rollouts were.
+
+        NeMo-RL counts a rollout's age from the weights version it raised when the previous
+        export returned. With background hot-loads the sampler can still serve older weights, so
+        the rollouts are ``sampler_lag`` versions older again: ``off_policy`` is the sum, in steps.
+        """
+        if "trajectory_age" in self.metrics:
+            self.metrics["sampler_lag"] = float(self.lag)
+            self.metrics["off_policy"] = self.metrics["trajectory_age"] + self.lag
         if self.metrics.get("step_time"):
             self.hub.publish({"type": "step_done", "step": self.step, "metrics": self.metrics,
                               "timings": self.timings})  # fmt: skip
@@ -202,10 +228,15 @@ def cwic_json(*args: str) -> dict:
 
 
 def poll_deployment(hub: Hub, launcher, gpus_per_replica: int, stop: threading.Event) -> None:
-    """Report the deployment's ready replicas every 10 seconds, so the page shows its GPUs."""
+    """Report the deployment's ready replicas every 10 seconds, so the page shows its GPUs. A
+    self-hosted sampler (``SAMPLER=vllm``) is one replica with all its GPUs once it serves."""
     last = None
     while not stop.wait(10):
         if not launcher.deployment_id:
+            if launcher.sampler_gpus and (last is None or int(time.time()) % 60 < 10):
+                hub.publish({"type": "metric", "k": "deployment", "ts": time.time(), "ready": 1, "desired": 1,
+                             "gpus": launcher.sampler_gpus})  # fmt: skip
+                last = (1, 1)
             continue
         try:
             found = cwic_json("inference", "deployment", "get", launcher.deployment_id)

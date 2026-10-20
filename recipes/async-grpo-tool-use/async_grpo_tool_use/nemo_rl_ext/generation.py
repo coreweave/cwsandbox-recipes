@@ -1,6 +1,8 @@
-"""``policy.generation.backend: coreweave_hotload``: generation on a Dedicated Inference deployment.
+"""``policy.generation.backend: coreweave_hotload``: generation on a sampler NeMo-RL does not run.
 
-NeMo-Gym samples from the deployment, so NeMo-RL never calls ``generate``. NeMo-RL still calls
+The sampler is a Dedicated Inference deployment (``hotload_cfg.target: di``) or the self-hosted
+vLLM of ``async_grpo_tool_use.sampler`` (``target: vllm``). NeMo-Gym samples from it, so NeMo-RL
+never calls ``generate``. NeMo-RL still calls
 the lifecycle methods, which do nothing here.
 
 Async GRPO sends this object to its trajectory collector actor, which reads ``cfg`` and calls
@@ -11,7 +13,11 @@ Config, under ``policy.generation.hotload_cfg``:
 
 * ``base_url``: the deployment's OpenAI URL (its gateway endpoint), ending in ``/v1``.
 * ``model``: the served model name.
-* ``deployment_id``: the deployment. Its bucket and prefix for snapshots come from the API.
+* ``target``: ``di`` (default) or ``vllm``.
+* ``deployment_id`` (``di``): the deployment. Its bucket and prefix for snapshots come from the API.
+* ``sampler_urls`` (``vllm``): the samplers' weight receivers, comma-separated.
+* ``transfer`` (``vllm``): ``shared`` when the sampler can read the trainer's export directory,
+  ``bucket`` to send exports through object storage (``weights_prefix``).
 * ``run_id``: prefix of every hot-load identity (``<run_id>-v000001``, ...).
 * ``max_model_len``: the deployment's ``max-model-len``.
 * ``max_versions_behind``: how many versions the deployment may lag the trainer (``.inf``: no
@@ -25,13 +31,16 @@ from typing import Any
 
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
-REQUIRED = ("base_url", "model", "deployment_id", "run_id")
+REQUIRED = {
+    "di": ("base_url", "model", "deployment_id", "run_id"),
+    "vllm": ("base_url", "model", "sampler_urls", "run_id"),
+}
 
 
 class HotLoadGeneration(GenerationInterface):
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = dict(config.get("hotload_cfg") or {})
-        missing = [key for key in REQUIRED if not cfg.get(key)]
+        missing = [key for key in REQUIRED.get(cfg.get("target") or "di", REQUIRED["di"]) if not cfg.get(key)]
         if missing:
             raise ValueError(f"hotload_cfg needs {', '.join(missing)}")
         if not cfg["base_url"].rstrip("/").endswith("/v1"):

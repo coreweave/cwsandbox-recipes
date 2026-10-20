@@ -1,9 +1,18 @@
-"""Hot-load new weights into the Dedicated Inference deployment after each training step.
+"""Hot-load new weights into the sampler after each training step.
 
 1. The policy workers export the weights as safetensors, one shard per rank, into
-   ``REFIT_EXPORT_DIR`` (node memory, ``/dev/shm``, on SUNK).
-2. A publisher thread uploads them with ``cwtrain.HotLoader`` as a full snapshot to the
-   deployment's hot-load bucket and creates a hot-load, which swaps the weights on every replica.
+   ``REFIT_EXPORT_DIR`` (node memory, ``/dev/shm``).
+2. A publisher thread loads them into the sampler, by ``hotload_cfg.target``:
+
+   * ``di`` (default): uploads them with ``cwtrain.HotLoader`` as a full snapshot to the Dedicated
+     Inference deployment's hot-load bucket and creates a hot-load, which swaps the weights on
+     every replica.
+   * ``vllm``: the self-hosted samplers (``async_grpo_tool_use.sampler``) whose weight receivers
+     are ``hotload_cfg.sampler_urls`` (comma-separated). By ``hotload_cfg.transfer``: ``shared``
+     (Slurm, sampler on the same node) loads the export where it is; ``bucket`` (GPU sandboxes)
+     uploads it once under ``hotload_cfg.weights_prefix`` in ``$HOTLOAD_BUCKET`` and every
+     sampler downloads it, in parallel. Each sampler pauses its requests, reloads the weights and
+     resumes them.
 
 ``hotload_cfg.max_versions_behind`` (default 0) is how many versions the deployment may lag the
 trainer when ``sync_weights`` returns:
@@ -44,6 +53,7 @@ import os
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -125,9 +135,9 @@ class HotLoadWeightSynchronizer(WeightSynchronizer):
         async_grpo: bool = False,
     ) -> None:
         cfg = generation.hotload_cfg
-        token = os.environ.get(cfg.get("token_env") or "COREWEAVE_API_TOKEN")
-        if not token:
-            raise ValueError("COREWEAVE_API_TOKEN must hold a CoreWeave API token with inference access")
+        self.target = cfg.get("target") or "di"
+        if self.target not in ("di", "vllm"):
+            raise ValueError(f"hotload_cfg.target must be di or vllm, got {self.target!r}")
         self.max_behind = float(cfg.get("max_versions_behind") or 0)
         if self.max_behind and not async_grpo:
             # Synchronous GRPO samples right after the sync, so it must wait for the new weights.
@@ -138,26 +148,43 @@ class HotLoadWeightSynchronizer(WeightSynchronizer):
         self.sizes = checkpoint_sizes(self.base)
         self.export_dir = Path(export_dir or os.environ.get("REFIT_EXPORT_DIR", "/work/refit"))
         self.run_id = cfg["run_id"]
-        from cwtrain import HotLoader, InferenceClient
+        if self.target == "vllm":
+            from async_grpo_tool_use.sampler import SamplerClient
 
-        self.loader = HotLoader(
-            InferenceClient(token=token),
-            cfg["deployment_id"],
-            s3=TunedS3(caios.client()),
-            poll_interval=POLL_INTERVAL_S,
-        )
+            self.samplers = [SamplerClient(url) for url in cfg["sampler_urls"].split(",")]
+            self.transfer = cfg.get("transfer") or "shared"
+            if self.transfer not in ("shared", "bucket"):
+                raise ValueError(f"hotload_cfg.transfer must be shared or bucket, got {self.transfer!r}")
+            if self.transfer == "bucket":
+                self.bucket, self.weights_prefix = os.environ["HOTLOAD_BUCKET"], cfg["weights_prefix"].rstrip("/")
+                self.s3 = caios.client()
+            destination = f"{len(self.samplers)} sampler(s) at {cfg['sampler_urls']} ({self.transfer})"
+        else:
+            token = os.environ.get(cfg.get("token_env") or "COREWEAVE_API_TOKEN")
+            if not token:
+                raise ValueError("COREWEAVE_API_TOKEN must hold a CoreWeave API token with inference access")
+            from cwtrain import HotLoader, InferenceClient
+
+            self.loader = HotLoader(
+                InferenceClient(token=token),
+                cfg["deployment_id"],
+                s3=TunedS3(caios.client()),
+                poll_interval=POLL_INTERVAL_S,
+            )
+            destination = f"deployment {cfg['deployment_id']}"
         self._stale = True
         # Shared with the publisher thread, under _cond.
         self._cond = threading.Condition()
         self._exported = 0  # newest version exported
         self._serving = 0  # newest version every replica serves (0: the base model)
+        self._sampler_prefix = ""  # bucket transfer: the export the sampler loaded last
         self._pending: Optional[Export] = None  # exported, upload not started yet
         self._error: Optional[BaseException] = None
         self._failed = False  # the publisher stopped on an error
         self._closing = False
         self._publisher: Optional[threading.Thread] = None
         print(
-            f"[grpo] weight sync: {len(self.dtypes)} tensors -> deployment {cfg['deployment_id']} "
+            f"[grpo] weight sync: {len(self.dtypes)} tensors -> {destination} "
             f"(up to {self.max_behind:g} versions behind)",
             flush=True,
         )
@@ -275,6 +302,8 @@ class HotLoadWeightSynchronizer(WeightSynchronizer):
                 return
 
     def _publish(self, export: Export, previous: int) -> None:
+        if self.target == "vllm":
+            return self._publish_to_sampler(export)
         from cwtrain.infra.models import PromptCachePolicy
 
         version, identity = export.version, self.identity(export.version)
@@ -303,6 +332,41 @@ class HotLoadWeightSynchronizer(WeightSynchronizer):
             f"[grpo] hot-load v{version}: {export.tensors} tensors, {export.bytes / 2**30:.1f} GiB; "
             f"export {export.export_s:.0f}s, upload and load {loaded - started:.0f}s "
             f"(upload {uploaded - started:.0f}s, swap {loaded - uploaded:.0f}s; trainer {behind} ahead)"
+            f"{', in the background' if self.max_behind else ''}",
+            flush=True,
+        )
+
+    def _publish_to_sampler(self, export: Export) -> None:
+        version = export.version
+        dashboard_event(version, "start")
+        started = time.perf_counter()
+        if self.transfer == "shared":
+            query = {"path": export.path}
+            how = "loaded in place"
+        else:
+            prefix = f"{self.weights_prefix}/v{version:06d}"
+            caios.upload_dir(self.s3, export.path, self.bucket, prefix, marker=False)
+            uploaded_s = time.perf_counter() - started
+            query = {"s3": prefix, "version": version}
+        with ThreadPoolExecutor(max_workers=len(self.samplers)) as pool:
+            results = list(pool.map(lambda sampler: sampler.load(**query), self.samplers))
+        if self.transfer == "bucket":
+            how = f"upload {uploaded_s:.0f}s, download {max(r['download_s'] for r in results):.0f}s"
+            if self._sampler_prefix:  # each export is full, so the previous one is not needed
+                caios.delete_prefix(self.s3, self.bucket, self._sampler_prefix)
+            self._sampler_prefix = prefix
+        paused = max(r["paused_s"] for r in results)
+        loaded = time.perf_counter()
+        with self._cond:
+            self._serving = version
+            behind = self._exported - version
+            self._cond.notify_all()
+        dashboard_event(version, "done")
+        shutil.rmtree(export.path, ignore_errors=True)
+        print(
+            f"[grpo] hot-load v{version}: {export.tensors} tensors, {export.bytes / 2**30:.1f} GiB; "
+            f"export {export.export_s:.0f}s, upload and load {loaded - started:.0f}s "
+            f"({how}, swap {paused:.0f}s; trainer {behind} ahead)"
             f"{', in the background' if self.max_behind else ''}",
             flush=True,
         )

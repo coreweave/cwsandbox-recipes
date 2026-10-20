@@ -54,6 +54,24 @@ def upload_dir(s3: Any, directory: Path, bucket: str, prefix: str, *, marker: bo
     return total
 
 
+def download_dir(s3: Any, bucket: str, prefix: str, directory: Path, *, workers: int = 8) -> int:
+    """Download every object directly under ``prefix`` into ``directory``. Return the bytes received."""
+    from boto3.s3.transfer import TransferConfig
+
+    config = TransferConfig(multipart_chunksize=64 * 2**20, max_concurrency=8)
+    prefix = prefix.rstrip("/")
+    directory.mkdir(parents=True, exist_ok=True)
+
+    def get(key: str) -> int:
+        path = directory / key[len(prefix) + 1 :]
+        s3.download_file(bucket, key, str(path), Config=config)
+        return path.stat().st_size
+
+    found = [key for key in keys(s3, bucket, prefix) if "/" not in key[len(prefix) + 1 :]]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return sum(pool.map(get, found))
+
+
 def copy_prefix(s3: Any, bucket: str, source: str, target: str, *, workers: int = 8) -> None:
     """Server-side copy of every object under ``source`` to ``target``."""
     source, target = source.rstrip("/"), target.rstrip("/")

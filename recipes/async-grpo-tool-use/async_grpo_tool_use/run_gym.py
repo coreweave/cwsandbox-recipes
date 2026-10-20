@@ -1,7 +1,8 @@
 """Entrypoint of the Gym CPU sandbox.
 
-Installs NeMo-Gym and starts its servers. The trainer on SUNK calls them through a Tailcat
-tunnel. Gym samples from the Dedicated Inference deployment over HTTPS.
+Installs NeMo-Gym and starts its servers. The trainer calls them through a Tailcat tunnel.
+Gym samples from the Dedicated Inference deployment over HTTPS, or from the self-hosted sampler
+(``SAMPLER=vllm``) through a second tunnel to it.
 
 Both agents, ``math_tir_agent`` (training) and ``math_eval_agent`` (AIME-2024 validation), run
 tool-integrated reasoning against the episode server in ``gym_env/math_sandbox_eval/``: each
@@ -24,6 +25,7 @@ from pathlib import Path
 from async_grpo_tool_use import tunnel
 from async_grpo_tool_use.inference import DeploymentSettings
 from async_grpo_tool_use.procs import log, read_env_file, require, run, spawn, supervise, wait_any, wait_for_file
+from async_grpo_tool_use.sampler import forwards
 
 GYM_REPO = "https://github.com/NVIDIA-NeMo/Gym.git"
 GYM_DIR = Path("/opt/gym")
@@ -41,10 +43,11 @@ CONFIGS = (
 )
 
 
-def overrides_yaml(rollout_url: str, served_model: str, tokenizer: str, revision: str) -> str:
-    """Gym config overlay: policy endpoint, localhost binds and fixed ports."""
+def overrides_yaml(rollout_urls: str, served_model: str, tokenizer: str, revision: str) -> str:
+    """Gym config overlay: policy endpoints (comma-separated; the model server spreads requests
+    over them), localhost binds and fixed ports."""
     return f"""\
-policy_base_url: {rollout_url}
+policy_base_url: [{", ".join(rollout_urls.split(","))}]
 policy_api_key: ${{oc.env:COREWEAVE_API_TOKEN}}
 policy_model_name: {served_model}
 port_range_low: 21010
@@ -118,20 +121,23 @@ def build_server_venv(server: Path, requirements: list[str]) -> None:
 def main() -> int:
     supervise()
     require("COREWEAVE_API_TOKEN")  # for the inference gateway
-    for name in ("CWSANDBOX_API_KEY", "CWSANDBOX_RUNNER_ID", "RUN_TAG"):
-        require(name)  # used by the eval server's cwsandbox provider
+    for name in ("CWSANDBOX_API_KEY", "RUN_TAG"):
+        require(name)  # used by the eval server's cwsandbox provider; CWSANDBOX_RUNNER_ID may be empty
     gym = install(os.environ.get("GYM_REF", "v0.6.0"))
     tailcat = tunnel.install(Path("/opt/tailcat"))
     ports = [TRAIN_AGENT_PORT, EVAL_AGENT_PORT, EVAL_SERVER_PORT]
     tunnel.serve(tailcat, ports, RUN_DIR / "gym.addr", RUN_DIR)  # the launcher passes this to SUNK
     log("gym: waiting for the inference deployment")
     inference = read_env_file(wait_for_file(RUN_DIR / "inference.env"))
-    rollout_url = inference["INFERENCE_BASE_URL"]
+    rollout_urls = inference.get("INFERENCE_BASE_URLS") or inference["INFERENCE_BASE_URL"]
+    # The self-hosted samplers' vLLMs, each local here at its own port.
+    for replica, address in enumerate(filter(None, inference.get("SAMPLER_ADDRS", "").split(","))):
+        tunnel.forward(tailcat, address, forwards(replica, receiver=False), RUN_DIR)
     overlay = RUN_DIR / "gym_overrides.yaml"
     overlay.write_text(
-        overrides_yaml(rollout_url, inference["INFERENCE_MODEL"], require("MODEL_REPO"), require("MODEL_REVISION"))
+        overrides_yaml(rollout_urls, inference["INFERENCE_MODEL"], require("MODEL_REPO"), require("MODEL_REVISION"))
     )
-    log(f"gym: starting servers against {rollout_url}, one sandbox per rollout")
+    log(f"gym: starting servers against {rollout_urls}, one sandbox per rollout")
     args = [arg for path in (*CONFIGS, str(overlay)) for arg in ("--config", path)]
     return wait_any([spawn([str(gym), "env", "start", *args], cwd=str(GYM_DIR))])
 

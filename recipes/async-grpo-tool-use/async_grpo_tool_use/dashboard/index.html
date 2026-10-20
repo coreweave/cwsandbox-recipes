@@ -163,7 +163,8 @@
   <span class="links" id="links"></span>
   <div class="hstat"><div class="k">Step</div><div class="v" id="stepV">–<small id="stepOf"></small></div></div>
   <div class="hstat"><div class="k">Avg reward</div><div class="v" id="rewardV">–</div></div>
-  <div class="hstat"><div class="k">Trainer GPUs training</div><div class="v" id="busyV">–</div></div>
+  <div class="hstat" title="How many steps old the rollouts of the last step were: NeMo-RL's average trajectory age, plus the versions the sampler still lagged behind the trainer's weights."><div class="k">Off-policy</div><div class="v" id="offV">–</div></div>
+  <div class="hstat"><div class="k" title="Share of the step time the trainer's GPUs spent training">Trainer busy</div><div class="v" id="busyV">–</div></div>
   <div class="hstat"><div class="k">Sandboxes started</div><div class="v" id="sbxTotalV">–</div></div>
   <div class="hstat"><div class="k">Elapsed</div><div class="v" id="elapsedV">0:00</div></div>
 </header>
@@ -177,7 +178,7 @@
   <div class="card" id="cardTrainer">
     <div class="top">
       <div class="icon"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg></div>
-      <div><h2>Trainer</h2><div class="sub">SUNK · H100 · NeMo-RL</div></div>
+      <div><h2>Trainer</h2><div class="sub" id="trainerSub">SUNK · H100 · NeMo-RL</div></div>
       <div class="state" id="stTrainer">idle</div>
     </div>
     <div class="kpis">
@@ -206,7 +207,7 @@
   <div class="card" id="cardSampler">
     <div class="top">
       <div class="icon"><svg viewBox="0 0 24 24"><path d="M4 12h3l2-6 4 12 2-6h5"/></svg></div>
-      <div><h2>Sampler</h2><div class="sub">Dedicated Inference · H100 · vLLM</div></div>
+      <div><h2>Sampler</h2><div class="sub" id="samplerSub">Dedicated Inference · H100 · vLLM</div></div>
       <div class="state" id="stSampler">idle</div>
     </div>
     <div class="kpis">
@@ -260,10 +261,19 @@ const PHASE_COLOR = { export: WHITE, hotload: WHITE, generation: BLUE, rewards: 
 const PHASE_LABEL = { export: "exporting weights", hotload: "hot-loading", generation: "waiting on rollouts", rewards: "processing rewards",
   logprobs: "logprobs", training: "training", validation: "validating" };
 const WINDOW_S = 360;
-const BRINGUP = [
-  ["storage", "object storage key"], ["gateway", "inference gateway"], ["gym", "NeMo-Gym sandbox"], ["node", "SUNK node"],
-  ["staged", "staging the model"], ["deployed", "inference deployment"], ["pool", "rollout sandboxes"], ["calibration", "verifier check"],
-];
+// What comes up before step 1, by where the trainer and the sampler run.
+function bringup() {
+  if (S.meta.trainer_kind === "sandbox") return [
+    ["storage", "object storage key"], ["gym", "NeMo-Gym sandbox"], ["node", "trainer GPU sandbox"],
+    ["deployed", `${S.meta.replicas || 1} vLLM sampler sandbox${(S.meta.replicas || 1) === 1 ? "" : "es"}`],
+    ["pool", "rollout sandboxes"], ["calibration", "verifier check"]];
+  if (S.meta.sampler_kind === "vllm") return [
+    ["gym", "NeMo-Gym sandbox"], ["node", "SUNK node"], ["deployed", "vLLM sampler step"],
+    ["pool", "rollout sandboxes"], ["calibration", "verifier check"]];
+  return [
+    ["storage", "object storage key"], ["gateway", "inference gateway"], ["gym", "NeMo-Gym sandbox"], ["node", "SUNK node"],
+    ["staged", "staging the model"], ["deployed", "inference deployment"], ["pool", "rollout sandboxes"], ["calibration", "verifier check"]];
+}
 // Step time by part, from NeMo-RL's own timings once a step finishes; live phases while it runs.
 const PARTS = [["sync", WHITE], ["gen", BLUE], ["train", BLUE3], ["val", AMBER], ["other", "#545a6b"]];
 const PART_OF_PHASE = { export: "sync", hotload: "sync", generation: "gen", rewards: "gen", logprobs: "train", training: "train", validation: "val" };
@@ -279,7 +289,9 @@ function onEvent(e) {
   if (S.t0 === null && Number.isFinite(e.t)) S.t0 = e.t;
   switch (e.type) {
     case "meta": Object.assign(S.meta, e);
-      $("algo").textContent = `· ${S.meta.async ? "Async GRPO" : "DAPO"}${S.meta.tir ? " with Python tool use" : ""} on Qwen2.5-Math-7B · NeMo-RL + NeMo-Gym`;
+      $("algo").textContent = `· ${S.meta.async ? "Async GRPO" : "DAPO"}${S.meta.tir ? " with Python tool use" : ""} on ${S.meta.model || "Qwen2.5-Math-7B"} · NeMo-RL + NeMo-Gym`;
+      if (S.meta.trainer_label) $("trainerSub").textContent = `${S.meta.trainer_label} · NeMo-RL`;
+      if (S.meta.sampler_label) $("samplerSub").textContent = `${S.meta.sampler_label} · vLLM`;
       renderLinks(); break;
     case "stage":
       if (!S.stages[e.stage]) S.stages[e.stage] = { t: e.t, args: e.args };
@@ -614,7 +626,7 @@ function laneTimeline(canvas) {
   const X = (t) => padL + (t - t0) / LANE_WINDOW_S * (w - padL - padR);
   const Xc = (t) => Math.min(Math.max(X(t), padL), w - padR);
   const usable = h - padT - padB - 3 * gap;
-  const lanes = [["Trainer", "8× H100", 0.32], ["Weights", "to the sampler", 0.16], ["Sampler", "rollouts in flight", 0.26], ["Sandboxes", "running code", 0.26]];
+  const lanes = [["Trainer", `${S.meta.trainer_gpus || 8}× ${S.meta.gpu_name || "H100"}`, 0.32], ["Weights", "to the sampler", 0.16], ["Sampler", "rollouts in flight", 0.26], ["Sandboxes", "running code", 0.26]];
   let y = padT;
   const L = lanes.map(([name, sub, share]) => { const lane = { name, sub, y, h: usable * share }; y += lane.h + gap; return lane; });
   const [trainer, weights, sampler, sandboxes] = L;
@@ -755,7 +767,7 @@ function recent(rows, maxAge = 4) { const r = rows[rows.length - 1]; return r &&
 function renderBringup() {
   let text = "";
   if (!S.ended && !S.step && S.t0 !== null) {
-    const next = BRINGUP.find(([key]) => !S.stages[key]);
+    const next = bringup().find(([key]) => !S.stages[key]);
     if (next) text = `Bringing up <b>${next[1]}</b> · ${mmss(now() - S.t0)}`;
   }
   if ($("bringup").innerHTML !== text) $("bringup").innerHTML = text;
@@ -775,7 +787,7 @@ function renderCards() {
   $("gpuV").innerHTML = (gpu ? Math.round(gpu.avg) : "–") + "<small>%</small>";
   const lastStep = S.steps[S.steps.length - 1];
   $("trainTokV").textContent = lastStep ? fmt(lastStep.metrics.train_tokens_s) : "–";
-  const gpus = $("gpus"); if (!gpus.children.length) gpus.innerHTML = "<div><b></b></div>".repeat(8);
+  const gpus = $("gpus"); if (!gpus.children.length) gpus.innerHTML = "<div><b></b></div>".repeat(S.meta.trainer_gpus || 8);
   [...gpus.children].forEach((d, i) => { d.firstChild.style.height = (gpu && gpu.util[i] !== undefined ? gpu.util[i] : 0) + "%"; });
   // environments
   const busy = env ? env.busy : 0, pool = env ? env.pool : (S.lastEnv ? S.lastEnv.sandboxes : 0);
@@ -813,20 +825,22 @@ function renderCards() {
   $("storage").classList.toggle("on", phase === "export" || hotloading);
   $("hotloadV").textContent = hotloading ? "· uploading + hot-loading" : phase === "export" ? "· exporting" : hl ? `· last ${hl.gib} GiB in ${hl.load_s}s` : "";
   // notes: what each part is doing right now
-  const dep = S.deploy[S.deploy.length - 1], replicas = dep ? dep.ready : (S.meta.replicas || 2);
+  const dep = S.deploy[S.deploy.length - 1], replicas = S.meta.sampler_kind === "vllm" ? (S.meta.replicas || 1) : dep ? dep.ready : (S.meta.replicas || 2);
+  const gib = hl ? `${hl.gib} GiB` : S.meta.sampler_kind === "vllm" ? "the" : "14 GiB";
+  const where = S.meta.trainer_kind === "sunk" && S.meta.sampler_kind === "vllm" ? "to the sampler on the same node" : "to object storage";
   const notes = {
     export: ["<b>Exporting new weights.</b> Rank 0 writes the updated policy.", "Paused until the new weights arrive."],
-    hotload: ["<b>Sending 14 GiB of weights</b> to object storage.", `<b>Hot-loading new weights</b> into ${replicas} replica${replicas === 1 ? "" : "s"}, no restart.`],
+    hotload: [`<b>Sending ${gib} weights</b> ${where}.`, `<b>Hot-loading new weights</b> into ${replicas} replica${replicas === 1 ? "" : "s"}, no restart.`],
     generation: ["<b>Waiting on rollouts.</b> Training GPUs sit idle until every answer is graded.", `<b>${samp ? samp.inflight : 0} rollouts generating</b> on ${replicas} replica${replicas === 1 ? "" : "s"}.`],
     rewards: ["<b>Turning grades into rewards</b> and advantages.", "Done with this batch."],
     logprobs: ["<b>Scoring every token</b> under the current policy.", "Idle until the next step's weights."],
-    training: ["<b>Updating the policy</b> on 8 GPUs.", "Idle until the next step's weights."],
+    training: [`<b>Updating the policy</b> on ${S.meta.trainer_gpus || 8} GPU${(S.meta.trainer_gpus || 8) === 1 ? "" : "s"}.`, "Idle until the next step's weights."],
     validation: ["<b>Validating</b> on AIME 2024.", "<b>Generating AIME answers</b> for validation."],
   };
   if (S.meta.async) notes.generation[0] = "<b>Waiting on rollouts.</b> The replay buffer fills up to a full batch.";
   let [nt, ns] = phase ? notes[phase]
-    : S.ended ? [S.stages.cleaned ? "Run finished. Everything it created is deleted." : "Run finished. Deleting what it created.", S.stages.cleaned ? "Deployment deleted." : "Deleting the deployment."]
-    : ["Starting up.", S.stages.deployed ? "Serving the base model." : "Waiting for the deployment."];
+    : S.ended ? [S.stages.cleaned ? "Run finished. Everything it created is deleted." : "Run finished. Deleting what it created.", S.stages.cleaned ? "Stopped." : "Stopping."]
+    : ["Starting up.", S.stages.deployed ? "Serving the base model." : S.meta.sampler_kind === "vllm" ? "Starting vLLM." : "Waiting for the deployment."];
   // async GRPO: the sampler keeps generating, and hot-loads, while the trainer trains
   if (phase && phase !== "hotload" && hotloading) ns = notes.hotload[1];
   else if (phase && S.meta.async && sActive) ns = notes.generation[1];
@@ -851,6 +865,8 @@ function renderCards() {
   const last = S.steps[S.steps.length - 1];
   $("rewardV").textContent = last && last.metrics.total_reward !== undefined ? last.metrics.total_reward.toFixed(2) : last && last.metrics.reward !== undefined ? last.metrics.reward.toFixed(2) : "–";
   $("sbxTotalV").textContent = S.lastEnv ? fmt(S.lastEnv.started + 1) : "–";
+  const off = S.steps.filter((x) => x.metrics.off_policy !== undefined).pop();
+  $("offV").innerHTML = off ? `${off.metrics.off_policy.toFixed(1)}<small> steps</small>` : "–";
   const done = S.steps.map(stepParts).filter((r) => r.total);
   $("busyV").textContent = done.length ? Math.round(100 * done.reduce((a, r) => a + r.parts.train, 0) / done.reduce((a, r) => a + r.total, 0)) + "%" : "–";
   $("elapsedV").textContent = S.t0 === null ? "0:00" : mmss((S.ended ? S.endT : now()) - S.t0);
@@ -898,11 +914,11 @@ function renderTable() {
   const rows = S.steps.slice(-5);
   if (!rows.length) return;
   const acc = new Map(S.accuracy.map((a) => [a.step, a.accuracy]));
-  let html = "<table><tr><th>Step</th><th>Time</th><th>Gen tok/s</th><th>Train tok/s</th><th>Reward</th><th>KL err</th><th>AIME</th></tr>";
+  let html = "<table><tr><th>Step</th><th>Time</th><th>Gen tok/s</th><th>Train tok/s</th><th>Reward</th><th title=\"rollout age in steps: NeMo-RL's trajectory age + sampler lag\">Off-policy</th><th>KL err</th><th>AIME</th></tr>";
   for (const s of rows) {
     const m = s.metrics, r = m.total_reward !== undefined ? m.total_reward : m.reward;
     html += `<tr><td>${s.step}</td><td>${Math.round(m.step_time || 0)}s</td><td>${fmt(m.gen_tokens_s)}</td><td>${fmt(m.train_tokens_s)}</td>
-      <td>${r !== undefined ? r.toFixed(2) : "–"}</td><td>${m.kl_error !== undefined ? m.kl_error.toFixed(4) : "–"}</td><td>${acc.has(s.step) ? (acc.get(s.step) * 100).toFixed(1) + "%" : "–"}</td></tr>`;
+      <td>${r !== undefined ? r.toFixed(2) : "–"}</td><td>${m.off_policy !== undefined ? m.off_policy.toFixed(1) : "–"}</td><td>${m.kl_error !== undefined ? m.kl_error.toFixed(4) : "–"}</td><td>${acc.has(s.step) ? (acc.get(s.step) * 100).toFixed(1) + "%" : "–"}</td></tr>`;
   }
   $("table").innerHTML = html + "</table>";
 }

@@ -9,7 +9,8 @@
    stops the viewer sandbox. It also stops when its lifetime (``DASHBOARD_HOURS``) runs out.
 
 The header links the W&B run (trainer metrics), the Agent Lens traces of the rollouts and the
-Weave evaluations, when ``WANDB_API_KEY`` is set.
+Weave evaluations, when ``WANDB_API_KEY`` is set. What the page draws also goes to a second W&B
+run in the same group, ``<run tag>-dashboard`` (``dashboard/wandb_log.py``).
 
 Usage: async-grpo [--max-num-steps N] [--no-share] [-- hydra overrides...]
    or: python -m async_grpo_tool_use.run ...
@@ -28,7 +29,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from async_grpo_tool_use import launch
-from async_grpo_tool_use.dashboard import server, share
+from async_grpo_tool_use.dashboard import server, share, wandb_log
 
 ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 FORGE_URL = "https://forge.coreweave.com/wandb"
@@ -55,8 +56,9 @@ def run_links(env: dict[str, str], run_tag: str) -> list[dict[str, str]]:
     project = f"{FORGE_URL}/{quote(env['WANDB_ENTITY'])}/{quote(env['WANDB_PROJECT'])}"
     return [
         {"label": "W&B run", "url": f"{project}/runs/{quote(run_tag)}"},
-        {"label": "Agent Lens traces", "url": f"{project}/weave/agents"},
-        {"label": "Weave evaluations", "url": f"{project}/weave/evaluations"},
+        {"label": "W&B: page metrics", "url": f"{project}/runs/{quote(run_tag)}-dashboard"},
+        {"label": "Agent Lens", "url": f"{project}/weave/agents"},
+        {"label": "Weave evals", "url": f"{project}/weave/evaluations"},
     ]
 
 
@@ -115,12 +117,22 @@ def main(argv: list[str] | None = None) -> int:
     # The launcher's own messages go through print(); send them through the parser too.
     launch.log = lambda message: sink(f"[grpo] {message}\n")
     pool = int(os.environ.get("SANDBOX_POOL_MAX", 256))
+    on_slurm, di = config.trainer == "sunk", config.sampler == "di"
+    gpu_name = "H100" if on_slurm else "RTX PRO 6000"
     meta = {
         "mode": "live", "run_tag": launcher.run_tag, "steps": int(config.env["MAX_NUM_STEPS"]),
-        "trainer": f"SUNK · {config.partition}", "replicas": config.deployment.replicas,
+        "trainer": f"SUNK · {config.partition}" if on_slurm else "GPU sandbox",
+        "model": config.model_repo.split("/")[-1], "gpu_name": gpu_name,
+        "trainer_label": f"SUNK · {gpu_name}" if on_slurm else f"CoreWeave GPU sandbox · {gpu_name}",
+        "sampler_label": ("Dedicated Inference · H100" if di else
+                          f"self-hosted on the trainer's node · {gpu_name}" if on_slurm
+                          else f"{config.sampler_replicas} CoreWeave GPU sandbox{'es' if config.sampler_replicas > 1 else ''} · {gpu_name}"),
+        "trainer_kind": config.trainer, "sampler_kind": config.sampler,
+        "replicas": config.deployment.replicas if di else config.sampler_replicas,
         "pool_max": pool, "pool_min": int(os.environ.get("SANDBOX_POOL_MIN", pool)),
-        "trainer_gpus": 8, "gpus_per_replica": config.deployment.gpus_per_replica, "tir": True, "async": True,
-        "links": run_links(config.env, launcher.run_tag),
+        "trainer_gpus": int(config.env.get("TRAINER_GPUS", 8)),
+        "gpus_per_replica": config.deployment.gpus_per_replica if di else int(config.env["SAMPLER_GPUS"]),
+        "tir": True, "async": True, "links": run_links(config.env, launcher.run_tag),
     }  # fmt: skip
     viewer = None
     if not args.no_share:
@@ -140,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[dashboard] {viewer.url}  (read-only, shareable)", flush=True)
     stop = threading.Event()
     code = 1
+    metrics_run = None
+    if meta["links"]:
+        metrics_run = wandb_log.WandbLog(hub, config.env, launcher.run_tag, meta)
     # From here on the viewer sandbox exists; the finally below stops it whatever fails.
     try:
         hub.publish({"type": "meta", **meta})
@@ -157,6 +172,8 @@ def main(argv: list[str] | None = None) -> int:
         hub.publish({"type": "stage", "stage": "exit", "args": ["1"]})
     finally:
         stop.set()
+        if metrics_run:
+            metrics_run.finish()
         try:
             if viewer:
                 print(f"[dashboard] still up at {viewer.url}; Ctrl+C stops it", flush=True)

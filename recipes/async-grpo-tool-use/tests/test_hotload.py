@@ -38,6 +38,12 @@ def test_checkpoint_dtypes_and_model_files(tmp_path):
     assert sorted(p.name for p in export.iterdir()) == ["config.json", "tokenizer.json"]
 
 
+def test_checkpoint_without_an_index_is_one_file(tmp_path):
+    _shard(tmp_path / "model.safetensors", {"a": "BF16", "b": "F32"})
+    assert hotload.checkpoint_dtypes(tmp_path) == {"a": "BF16", "b": "F32"}
+    assert hotload.checkpoint_sizes(tmp_path) == {"a": 2, "b": 2}
+
+
 def test_deployment_spec_enables_hot_load():
     spec = deployment_spec("run", "gw", "bucket", "p/base", "p/hotload", DeploymentSettings(replicas=3))
     assert spec["hotLoad"] == {"bucket": "bucket", "pathPrefix": "p/hotload", "transitionMode": "TRANSITION_MODE_ASYNC"}
