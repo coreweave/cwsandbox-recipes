@@ -9,10 +9,13 @@ one sandbox from ``/seed_session`` until ``/verify``:
 2. ``/execute_python`` writes the code to ``/work/cell_<n>.py`` in the episode's sandbox and runs
    it with a time limit. Each cell runs on its own, as in Qwen2.5-Math's own TIR evaluation;
    files written in ``/work`` stay for the later cells of the episode.
-3. ``/verify`` grades the final answer with math-verify in the same sandbox, then empties
-   ``/work`` and returns the sandbox to the pool.
+3. ``/verify`` grades the final answer with math-verify in a separate grading sandbox, then
+   stops the episode's sandbox. The pool starts a fresh one in its place.
 
-So the number of sandboxes in use follows the number of rollouts in flight. The pool, its
+Model code never shares a sandbox with the grader or with another rollout: it runs as root and
+could change any file, process or package, so a sandbox that ran it is never reused, and the
+grading sandboxes (``grader_pool_size``) only ever receive the expected and the extracted answer
+as data. So the number of sandboxes in use follows the number of rollouts in flight. The pool, its
 ``pool_size``/``max_pool_size`` bounds and the ``@@metric`` rows
 come from ``MathSandboxEvalServer`` (``app.py``); here ``busy`` counts sandboxes held by
 episodes and ``waiting`` counts rollouts waiting for one. ``/calibrate`` works as in ``app.py``.
@@ -55,6 +58,7 @@ class MathTirConfig(MathSandboxEvalConfig):
     grade_timeout_s: PositiveInt = 20
     max_output_chars: PositiveInt = 512
     episode_timeout_s: float = 1800  # a rollout that never reached /verify gives its sandbox back
+    grader_pool_size: PositiveInt = 8  # grading sandboxes; they never run model code
     # The cwsandbox SDK blocks, so every sandbox call takes a thread while it runs. asyncio's
     # default of about 32 threads would queue hundreds of episodes behind a few calls.
     threads: PositiveInt = 1024
@@ -86,6 +90,8 @@ class MathTirServer(MathSandboxEvalServer):
         self._examples = 0
         self._last_example = 0.0
         self._forge = forge.Forge.from_env()
+        self._graders: asyncio.Queue | None = None
+        self._graders_lock = asyncio.Lock()
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -129,21 +135,60 @@ class MathTirServer(MathSandboxEvalServer):
         return episode
 
     async def _release(self, episode: Episode) -> None:
-        """Empty the episode's work directory and return the sandbox to the pool. A sandbox that
-        cannot be reset is stopped; ``_maintain`` starts another up to the minimum."""
-        try:
-            reset = await episode.sandbox.exec(f"rm -rf {WORKDIR} && mkdir -p {WORKDIR}", timeout_s=60)
-            reusable = reset.return_code == 0
-        except Exception as exc:  # noqa: BLE001 - the sandbox may be gone; any failure means do not reuse it
-            print(f"[math_tir_sandbox] reset failed, stopping the sandbox: {exc}", flush=True)
-            reusable = False
+        """Stop the episode's sandbox: the model's code may have changed anything in it.
+        ``_maintain`` starts a fresh one up to the pool's minimum."""
         self._busy -= 1
-        if reusable:
-            self._free.put_nowait((episode.sandbox, time.monotonic()))
-            return
         self._size -= 1
         self._stopped += 1
-        asyncio.create_task(episode.sandbox.stop())
+        try:
+            await episode.sandbox.stop()
+        except Exception as exc:  # noqa: BLE001 - it may be gone already; the run's cleanup stops it by tag
+            print(f"[math_tir_sandbox] stopping an episode sandbox failed: {exc}", flush=True)
+
+    async def _grader(self) -> asyncio.Queue:
+        async with self._graders_lock:
+            if self._graders is None:
+                sandboxes = await asyncio.gather(
+                    *(MathSandboxEvalServer._new_sandbox(self) for _ in range(self.config.grader_pool_size))
+                )
+                self._graders = asyncio.Queue()
+                for sandbox in sandboxes:
+                    self._graders.put_nowait(sandbox)
+                print(f"[math_tir_sandbox] {len(sandboxes)} grading sandboxes ready", flush=True)
+            return self._graders
+
+    async def _run_verifier(self, cases: list[dict[str, str]], limit: float) -> Any:
+        """Run ``verify_answer.py`` on ``cases`` in a grading sandbox. Returns the exec result,
+        or None when it ran over ``limit``."""
+        graders = await self._grader()
+        sandbox = await graders.get()
+        try:
+            remote = f"/tmp/cases-{uuid.uuid4().hex}.json"
+            with tempfile.NamedTemporaryFile("w", suffix=".json") as fh:
+                json.dump(cases, fh)
+                fh.flush()
+                await sandbox.upload(fh.name, remote)
+            try:
+                return await sandbox.exec(f"timeout {limit} python3 {REMOTE_VERIFIER} {remote}", timeout_s=limit + 30)
+            except SandboxTimeoutError:
+                return None
+        except SandboxUnavailableError:
+            # Replace a grader that went away, so the caller's retry and later rollouts get a live one.
+            asyncio.create_task(sandbox.stop())
+            sandbox = await MathSandboxEvalServer._new_sandbox(self)
+            raise
+        finally:
+            graders.put_nowait(sandbox)
+
+    async def _grade(self, cases: list[dict[str, str]]) -> list[dict[str, Any]]:
+        """``/calibrate``: grade known cases in the grading sandboxes."""
+        result = await self._run_verifier(cases, self.config.exec_timeout_s)
+        if result is None or result.return_code != 0:
+            raise RuntimeError(f"verify_answer.py failed: {result.stderr if result else 'timed out'}")
+        graded = json.loads(result.stdout)
+        self._graded += len(graded)
+        self._correct += sum(1 for row in graded if row["reward"] > 0)
+        return graded
 
     async def _reap(self) -> None:
         """Give back the sandboxes of rollouts that stopped before /verify (a failed model call,
@@ -179,17 +224,9 @@ class MathTirServer(MathSandboxEvalServer):
         episode.timeline.append(forge.Cell(body.code, output, began, time.time()))
         return PlainTextResponse(output)
 
-    async def _grade_in(self, sandbox: AsyncSandbox, expected: str, response: str) -> dict[str, Any]:
-        remote = f"/tmp/cases-{time.monotonic_ns()}.json"
-        with tempfile.NamedTemporaryFile("w", suffix=".json") as fh:
-            json.dump([{"expected": expected, "response": response}], fh)
-            fh.flush()
-            await sandbox.upload(fh.name, remote)
+    async def _grade_answer(self, expected: str, response: str) -> dict[str, Any]:
         limit = self.config.grade_timeout_s
-        try:
-            result = await sandbox.exec(f"timeout {limit} python3 {REMOTE_VERIFIER} {remote}", timeout_s=limit + 30)
-        except SandboxTimeoutError:
-            result = None
+        result = await self._run_verifier([{"expected": expected, "response": response}], limit)
         if result is None or result.return_code == tir.TIMEOUT_RETURN_CODE:
             print(f"[math_tir_sandbox] grading ran over {limit} s; reward 0", flush=True)
             self._graded += 1
@@ -225,11 +262,11 @@ class MathTirServer(MathSandboxEvalServer):
             graded = {"reward": 0.0, "extracted": None}
             if answer is not None:
                 try:
-                    graded = await self._grade_in(episode.sandbox, body.expected_answer, answer)
+                    graded = await self._grade_answer(body.expected_answer, answer)
                 except SandboxUnavailableError:
                     # A serverless sandbox's stream sometimes resets; one retry gets through.
                     await asyncio.sleep(1)
-                    graded = await self._grade_in(episode.sandbox, body.expected_answer, answer)
+                    graded = await self._grade_answer(body.expected_answer, answer)
             self._report_example(body, output, graded, episode)
             if self._forge:
                 asyncio.create_task(self._log_to_forge(body, output, answer, graded, episode))

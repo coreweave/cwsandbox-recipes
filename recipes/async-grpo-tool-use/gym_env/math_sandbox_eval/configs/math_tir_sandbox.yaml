@@ -1,5 +1,5 @@
-# Tool-integrated reasoning: each rollout holds its own CoreWeave sandbox, runs its python
-# cells there and is graded there (tir_app.py). Replaces math_sandbox_eval.yaml when DAPO_TIR=1,
+# Tool-integrated reasoning: each rollout gets a fresh CoreWeave sandbox, runs its python
+# cells there and is graded in a separate grading sandbox (tir_app.py). Replaces math_sandbox_eval.yaml when DAPO_TIR=1,
 # so the server keeps its name (the trainer's /calibrate call and run_gym's port overlay find it).
 # run_gym.py sets the host, the ports and the runner.
 math_sandbox_eval:
@@ -15,6 +15,7 @@ math_sandbox_eval:
       pool_size: ${oc.env:SANDBOX_POOL_MIN,256}
       max_pool_size: ${oc.env:SANDBOX_POOL_MAX,256}
       idle_timeout_s: ${oc.env:SANDBOX_POOL_IDLE_S,20}
+      grader_pool_size: ${oc.env:GRADER_POOL_SIZE,8}
       cpu: 1
       memory_mib: 2048
       setup_command: pip install --quiet --no-cache-dir math-verify==0.8.0 numpy sympy
