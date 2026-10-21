@@ -1,9 +1,10 @@
 # Sandbox runner for this recipe. Copy to infra/runner.yaml, fill in the <...> values, then:
 #   cwic sandbox runner create <runner-id> -f infra/runner.yaml
 #
-# It runs CPU sandboxes only: the Gym sandbox (8 CPU, 32Gi) and up to 4 grading
-# sandboxes (2 CPU, 4Gi each). They need internet egress: the Tailcat relay, the
-# inference gateway and Hugging Face (tokenizer).
+# It runs CPU sandboxes only: the Gym sandbox (8 CPU, 32Gi), up to 256 rollout
+# sandboxes (SANDBOX_POOL_MAX) and 8 grading sandboxes (GRADER_POOL_SIZE), 1 CPU and
+# 2Gi each. They need internet egress: the Tailcat relay, the sampler endpoint and
+# Hugging Face (tokenizer).
 identity:
   runner_id: <runner-id>            # e.g. async-grpo-runner
   zone: <zone>                      # e.g. us-east-01a

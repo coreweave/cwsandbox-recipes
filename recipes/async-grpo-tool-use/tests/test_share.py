@@ -1,12 +1,15 @@
 """Sharing the dashboard: what viewers see, the relay to the viewer sandbox, and the header links."""
 
 import json
+import os
+import sys
 import threading
+import types
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from async_grpo_tool_use import run
+from async_grpo_tool_use import cleanup, env_file, run
 from async_grpo_tool_use.dashboard import share
 from async_grpo_tool_use.dashboard.server import Hub
 from async_grpo_tool_use.dashboard.viewer import make_viewer_handler
@@ -16,7 +19,7 @@ SENSITIVE = [
     "[grpo] inference: gateway 09757ea9-7852-4486-9f17-e36018182d1c ready at https://async-grpo-1.ab12cd.gw.cwinference.com",
     "[grpo] trainer: starting GRPO (grpo_async_qwen.yaml) on 8 GPUs, rollouts from https://async-grpo-1.ab12cd.gw.cwinference.com/v1",
     "[grpo] sunk: job 80 submitted (/mnt/data/someone/async-grpo/runs/async-grpo-10831481)",
-    "[grpo] storage: temporary access key for s3://gradient-hotloading/cookbook/async-grpo-tool-use/runs/async-grpo-1",
+    "[grpo] storage: temporary access key for s3://my-bucket/cookbook/async-grpo-tool-use/runs/async-grpo-1",
     "[gym] [grpo] tunnel: forwarding to 10.0.12.34:7443",
     "[grpo] could not reach login.cluster.internal.example.com:22",
     "COREWEAVE_API_TOKEN=CW-SECRET-abc AWS_SECRET_ACCESS_KEY=xyz Authorization: Bearer eyJhbGciOi",
@@ -34,7 +37,7 @@ HARMLESS = [
 def test_scrub_removes_secrets_addresses_and_home_directories():
     clean = share.scrub(SENSITIVE, known=["CW-SECRET-abc"])
     text = "\n".join(clean)
-    for leak in ("cwinference", "/mnt/data", "someone", "gradient-hotloading", "10.0.12.34", "example.com",
+    for leak in ("cwinference", "/mnt/data", "someone", "my-bucket", "10.0.12.34", "example.com",
                  "CW-SECRET", "xyz", "eyJ", "AKIA", "wandb_v1", "09757ea9"):  # fmt: skip
         assert leak not in text, leak
     assert clean[2] == "[grpo] sunk: job 80 submitted (<path>"
@@ -157,9 +160,26 @@ def test_the_viewer_sandbox_gets_every_file_it_imports():
 
 def test_dotenv_lines(tmp_path):
     env = tmp_path / ".env"
-    env.write_text("# comment\n\nCWSANDBOX_API_KEY=abc\nexport SUNK_DATA_DIR='/mnt/data/me'\n# WANDB_API_KEY=\n")
-    assert run.read_dotenv(env) == {"CWSANDBOX_API_KEY": "abc", "SUNK_DATA_DIR": "/mnt/data/me"}
-    assert run.read_dotenv(tmp_path / "missing") == {}
+    env.write_text(
+        "# comment\n\nCWSANDBOX_API_KEY=abc\nexport SUNK_DATA_DIR='/mnt/data/me'\n# WANDB_API_KEY=\n"
+        "SAMPLER_REPLICAS=2              # samplers, one GPU sandbox each\nPASSWORD='a #b'  # kept in quotes\n"
+    )
+    assert env_file.read_dotenv(env) == {
+        "CWSANDBOX_API_KEY": "abc", "SUNK_DATA_DIR": "/mnt/data/me", "SAMPLER_REPLICAS": "2", "PASSWORD": "a #b",
+    }  # fmt: skip
+    assert env_file.read_dotenv(tmp_path / "missing") == {}
+
+
+def test_every_command_reads_the_env_file(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_text("CWSANDBOX_API_KEY=from-file\n")
+    monkeypatch.delenv("CWSANDBOX_API_KEY", raising=False)
+    monkeypatch.setattr(env_file, "ENV_FILE", env)
+    stopped = []
+    monkeypatch.setattr(cleanup, "stop_tagged", lambda sdk, tag: stopped.append(tag) or 0)
+    monkeypatch.setitem(sys.modules, "cwsandbox", types.ModuleType("cwsandbox"))
+    assert cleanup.main(["--tag", "async-grpo-1"]) == 0
+    assert os.environ["CWSANDBOX_API_KEY"] == "from-file" and stopped == ["async-grpo-1"]
 
 
 def test_the_shared_url_comes_back_before_the_page_answers():

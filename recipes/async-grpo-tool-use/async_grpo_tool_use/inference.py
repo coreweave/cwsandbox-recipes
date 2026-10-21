@@ -4,12 +4,16 @@ The launcher uses this module to create, and at the end delete:
 
 * an inference gateway (the HTTPS endpoint Gym calls) and a hot-load deployment of the base
   model behind it, with ``cwtrain`` (the Dedicated Inference client library),
-* a temporary object storage access key for the SUNK trainer, with ``cwic``.
+* a temporary object storage access key for the trainer, with ``cwic``.
+
+``cwic`` runs with the run's CoreWeave API token (``COREWEAVE_API_TOKEN``), so the key belongs
+to the same organization as the sandboxes, not to whichever account ``cwic`` last logged in as.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -17,11 +21,15 @@ from typing import Any, Callable
 Runner = Callable[[list[str]], str]
 
 
-def run_cwic(args: list[str]) -> str:
-    done = subprocess.run(["cwic", *args], capture_output=True, text=True)
-    if done.returncode != 0:
-        raise RuntimeError(f"cwic {' '.join(args[:3])} failed: {done.stderr.strip() or done.stdout.strip()}")
-    return done.stdout
+def cwic_runner(token: str) -> Runner:
+    def run(args: list[str]) -> str:
+        env = {**os.environ, "COREWEAVE_API_TOKEN": token}
+        done = subprocess.run(["cwic", *args], capture_output=True, text=True, env=env)
+        if done.returncode != 0:
+            raise RuntimeError(f"cwic {' '.join(args[:3])} failed: {done.stderr.strip() or done.stdout.strip()}")
+        return done.stdout
+
+    return run
 
 
 @dataclass(frozen=True)
@@ -58,19 +66,22 @@ def deployment_spec(
 class Inference:
     """``client`` is a ``cwtrain.InferenceClient`` (a fake in tests); ``cwic`` runs the CLI."""
 
-    def __init__(self, client: Any, cwic: Runner = run_cwic) -> None:
+    def __init__(self, client: Any, cwic: Runner) -> None:
         self.client = client
         self.cwic = cwic
 
     # ------------------------------------------------------- gateway, deployment
 
-    def create_gateway(self, name: str, zone: str) -> tuple[str, str]:
-        """Create a gateway with CoreWeave auth. Return (id, https endpoint) once READY."""
+    def create_gateway(self, name: str, zone: str) -> str:
+        """Create a gateway with CoreWeave auth and return its id, so cleanup knows it even if it never gets ready."""
+        spec = {"name": name, "zones": [zone], "coreWeaveAuth": {}, "bodyBasedRouting": {"apiType": "API_TYPE_OPENAI"}}
+        return self.client.create_gateway(spec).id
+
+    def wait_gateway(self, gateway_id: str) -> str:
+        """The gateway's https endpoint, once READY."""
         from cwtrain.infra import lifecycle
 
-        spec = {"name": name, "zones": [zone], "coreWeaveAuth": {}, "bodyBasedRouting": {"apiType": "API_TYPE_OPENAI"}}
-        gateway = lifecycle.wait_for_gateway(self.client, self.client.create_gateway(spec).id)
-        return gateway.id, gateway.endpoints[0]
+        return lifecycle.wait_for_gateway(self.client, gateway_id).endpoints[0]
 
     def create_deployment(self, spec: dict[str, Any]) -> str:
         return self.client.create_deployment(spec).id

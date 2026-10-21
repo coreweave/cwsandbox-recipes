@@ -25,28 +25,12 @@ import sys
 import threading
 import time
 import traceback
-from pathlib import Path
 from urllib.parse import quote
 
-from async_grpo_tool_use import launch
+from async_grpo_tool_use import env_file, launch
 from async_grpo_tool_use.dashboard import server, share, wandb_log
 
-ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 FORGE_URL = "https://forge.coreweave.com/wandb"
-
-
-def read_dotenv(path: Path) -> dict[str, str]:
-    """``KEY=VALUE`` lines of a .env file; comments, blank lines and ``export`` are allowed."""
-    values = {}
-    if not path.is_file():
-        return values
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.removeprefix("export ").split("=", 1)
-        values[key.strip()] = value.strip().strip("'\"")
-    return values
 
 
 def run_links(env: dict[str, str], run_tag: str) -> list[dict[str, str]]:
@@ -94,8 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("overrides", nargs="*", help="Hydra overrides for NeMo-RL (after --)")
     args = parser.parse_args(argv)
 
-    for key, value in read_dotenv(ENV_FILE).items():
-        os.environ.setdefault(key, value)
+    env_file.load()
     if not os.environ.get("CWSANDBOX_API_KEY"):
         print("set CWSANDBOX_API_KEY (a CoreWeave API access token) in .env", file=sys.stderr)
         return 2
@@ -153,10 +136,13 @@ def main(argv: list[str] | None = None) -> int:
     stop = threading.Event()
     code = 1
     metrics_run = None
-    if meta["links"]:
-        metrics_run = wandb_log.WandbLog(hub, config.env, launcher.run_tag, meta)
     # From here on the viewer sandbox exists; the finally below stops it whatever fails.
     try:
+        if meta["links"]:
+            try:
+                metrics_run = wandb_log.WandbLog(hub, config.env, launcher.run_tag, meta)
+            except Exception as exc:  # noqa: BLE001 - the run goes on without the dashboard's W&B run
+                print(f"[dashboard] could not log the dashboard to W&B: {exc}", flush=True)
         hub.publish({"type": "meta", **meta})
         print(f"[dashboard] {server.serve(hub, meta, args.port)}  (this machine)", flush=True)
         for link in meta["links"]:
@@ -172,9 +158,9 @@ def main(argv: list[str] | None = None) -> int:
         hub.publish({"type": "stage", "stage": "exit", "args": ["1"]})
     finally:
         stop.set()
-        if metrics_run:
-            metrics_run.finish()
         try:
+            if metrics_run:
+                metrics_run.finish()
             if viewer:
                 print(f"[dashboard] still up at {viewer.url}; Ctrl+C stops it", flush=True)
                 while True:

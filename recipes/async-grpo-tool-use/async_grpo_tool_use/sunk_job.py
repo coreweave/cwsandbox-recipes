@@ -122,17 +122,18 @@ def main(run_dir: Path, overrides: list[str]) -> int:
     mounts[refit] = str(refit)
     trainer_command = [TRAINER_PYTHON, "-m", "async_grpo_tool_use.run_trainer", *overrides]
     if os.environ.get("SAMPLER") != "vllm":
-        steps = [spawn(step(image, mounts, trainer_command))]
+        steps = [spawn(step(image, mounts, trainer_command, cpus=int(os.environ.get("SLURM_CPUS_PER_TASK") or 112)))]
     else:
         node_gpus = int(os.environ.get("SLURM_GPUS_ON_NODE") or 8)
         sampler_gpus = int(os.environ.get("SAMPLER_GPUS") or 4)
         trainer_gpus = node_gpus - sampler_gpus
+        cpus = int(os.environ.get("SLURM_CPUS_PER_TASK") or 112) // 2
         # The trainer downloads the model into /work; the sampler waits for it, then serves it.
         os.environ.update(TRAINER_GPUS=str(trainer_gpus), SAMPLER_WAIT_FOR_MODEL="1", TAILCAT_DIR="/work/bin")
         steps = [
-            spawn(step(image, mounts, trainer_command, gpus=trainer_gpus, cpus=56)),
+            spawn(step(image, mounts, trainer_command, gpus=trainer_gpus, cpus=cpus)),
             spawn(step(image, mounts, [TRAINER_PYTHON, "-m", "async_grpo_tool_use.sampler", "/job"],
-                       gpus=sampler_gpus, cpus=56, name="sampler")),
+                       gpus=sampler_gpus, cpus=cpus, name="sampler")),
         ]  # fmt: skip
     try:
         return wait_any(steps)

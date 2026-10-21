@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from async_grpo_tool_use import hotload
+from async_grpo_tool_use import inference as inference_module
 from async_grpo_tool_use.inference import DeploymentSettings, Inference, deployment_spec
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "gym_env"))
@@ -66,7 +67,8 @@ def test_inference_creates_and_deletes_with_cwtrain(monkeypatch):
     monkeypatch.setattr(lifecycle, "delete_deployment", lambda c, did, timeout: calls.append(("delete", did)))
     monkeypatch.setattr(lifecycle, "delete_gateway", lambda c, gid: calls.append(("delete", gid)))
     inference = Inference(client, cwic=lambda args: json.dumps({"location": "US-EAST-02A"}))
-    assert inference.create_gateway("run", "US-WEST-04A") == ("gw", "https://gw")
+    assert inference.create_gateway("run", "US-WEST-04A") == "gw"
+    assert inference.wait_gateway("gw") == "https://gw"
     assert calls[0][1]["zones"] == ["US-WEST-04A"] and "coreWeaveAuth" in calls[0][1]
     assert inference.create_deployment({}) == "dep"
     inference.wait_deployment("dep")
@@ -74,6 +76,18 @@ def test_inference_creates_and_deletes_with_cwtrain(monkeypatch):
     inference.delete_gateway("gw")
     assert calls[1:] == [("ready", "dep"), ("delete", "dep"), ("delete", "gw")]
     assert inference.bucket_zone("b") == "US-EAST-02A"
+
+
+def test_cwic_runs_with_the_run_token_not_its_own_login(monkeypatch):
+    seen = {}
+
+    def fake_run(command, capture_output, text, env):
+        seen.update(command=command, token=env["COREWEAVE_API_TOKEN"])
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(inference_module.subprocess, "run", fake_run)
+    inference_module.cwic_runner("cw-token")(["cwobject", "bucket", "get", "b"])
+    assert seen == {"command": ["cwic", "cwobject", "bucket", "get", "b"], "token": "cw-token"}
 
 
 class FakeTokenizer:

@@ -86,10 +86,16 @@ def copy_prefix(s3: Any, bucket: str, source: str, target: str, *, workers: int 
 def delete_prefix(s3: Any, bucket: str, prefix: str) -> int:
     """Delete every object under ``prefix`` and abort its unfinished multipart uploads."""
     found = keys(s3, bucket, prefix)
+    failed = []
     for start in range(0, len(found), 1000):
         batch = [{"Key": key} for key in found[start : start + 1000]]
-        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-    uploads = s3.list_multipart_uploads(Bucket=bucket, Prefix=prefix.rstrip("/") + "/").get("Uploads", [])
-    for upload in uploads:
-        s3.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+        response = s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
+        failed += response.get("Errors", [])
+    pages = s3.get_paginator("list_multipart_uploads").paginate(Bucket=bucket, Prefix=prefix.rstrip("/") + "/")
+    for page in pages:
+        for upload in page.get("Uploads", []):
+            s3.abort_multipart_upload(Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+    if failed:
+        first = failed[0]
+        raise RuntimeError(f"{len(failed)} object(s) not deleted, first {first.get('Key')}: {first.get('Code')}")
     return len(found)

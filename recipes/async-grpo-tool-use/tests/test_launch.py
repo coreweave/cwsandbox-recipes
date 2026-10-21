@@ -130,7 +130,10 @@ class FakeInference:
 
     def create_gateway(self, name, zone):
         self.calls.append(("gateway", zone))
-        return "gw-1", "https://gw.example"
+        return "gw-1"
+
+    def wait_gateway(self, gateway_id):
+        return "https://gw.example"
 
     def create_deployment(self, spec):
         self.spec = spec
@@ -154,18 +157,18 @@ class FakeS3:
         self.deleted = []
 
     def get_paginator(self, name):
+        if name == "list_multipart_uploads":
+            return SimpleNamespace(paginate=lambda Bucket, Prefix: [{}])
         return SimpleNamespace(paginate=lambda Bucket, Prefix: [{"Contents": [{"Key": Prefix + "base/config.json"}]}])
 
     def delete_objects(self, Bucket, Delete):
         self.deleted += [o["Key"] for o in Delete["Objects"]]
-
-    def list_multipart_uploads(self, Bucket, Prefix):
         return {}
 
 
 def _launcher(sunk=None, **settings):
     environ = {"CWSANDBOX_RUNNER_ID": "my-runner", "CWSANDBOX_API_KEY": "cw-token", "SUNK_DATA_DIR": "/mnt/data/me",
-               "HF_TOKEN": "hf", "HOTLOAD_BUCKET": "gradient-hotloading", **settings}  # fmt: skip
+               "HF_TOKEN": "hf", "HOTLOAD_BUCKET": "my-bucket", **settings}  # fmt: skip
     args = argparse.Namespace(max_num_steps=2, overrides=["grpo.seed=1"])
     config = launch.config_from_env(args, environ)
     if config.trainer == "sunk":
@@ -210,7 +213,7 @@ def test_run_wires_gym_sunk_job_and_deployment():
     # The deployment loads the run's model copy and hot-loads from the run's prefix.
     prefix = f"cookbook/async-grpo-tool-use/runs/{tag}"
     spec = inference.spec
-    assert spec["model"] == {"name": tag, "bucket": "gradient-hotloading", "path": f"{prefix}/base"}
+    assert spec["model"] == {"name": tag, "bucket": "my-bucket", "path": f"{prefix}/base"}
     assert spec["hotLoad"]["pathPrefix"] == f"{prefix}/hotload" and spec["runtime"]["engine"] == "dynamo-vllm"
     assert spec["gatewayIds"] == ["gw-1"] and ("ready", "dep-1") in inference.calls
     # Both sides got the endpoint, privately on SUNK.
@@ -235,6 +238,31 @@ def test_cleanup_runs_every_step_after_a_failure():
     assert launcher.run() == 1
     assert launcher.deployment_id is None and ("delete gateway", "gw-1") in launcher.inference.calls
     assert ("revoke", "AK") in launcher.inference.calls and sdk.created[0].stopped
+
+
+def test_a_failed_sbatch_still_removes_the_staged_secrets():
+    class NoSbatch(FakeSunk):
+        def submit(self, sbatch_args, command):
+            raise RuntimeError("sbatch: error: invalid partition")
+
+    launcher, _ = _launcher(NoSbatch())
+    with pytest.raises(RuntimeError, match="sbatch"):
+        launcher.run()
+    assert launcher.job_id is None and "cancel" not in [call[0] for call in launcher.sunk.calls]
+    [remove] = [call[1] for call in launcher.sunk.calls if call[0] == "run" and "secrets.env" in call[1]]
+    assert f"{launcher.run_dir}/secrets.env" in remove and f"{launcher.run_dir}/*.addr" in remove
+
+
+def test_a_gateway_that_never_gets_ready_is_still_deleted():
+    class StuckGateway(FakeInference):
+        def wait_gateway(self, gateway_id):
+            raise TimeoutError("gateway gw-1 not ready")
+
+    launcher, _ = _launcher()
+    launcher.inference = StuckGateway()
+    with pytest.raises(TimeoutError):
+        launcher.run()
+    assert ("delete gateway", "gw-1") in launcher.inference.calls
 
 
 def test_failed_job_returns_its_exit_code():
@@ -396,7 +424,7 @@ def test_gpu_sandboxes_run_trainer_and_sampler_with_weights_through_the_bucket()
     assert env["MODEL_REPO"] == "Qwen/Qwen2.5-Math-1.5B" and env["SAMPLER"] == "vllm" and env["TRAINER_GPUS"] == "1"
     for sandbox in (*samplers, trainer):  # the trainer uploads each export, each sampler downloads it
         env = sandbox.kwargs["environment_variables"]
-        assert env["AWS_SECRET_ACCESS_KEY"] == "SK" and env["HOTLOAD_BUCKET"] == "gradient-hotloading"
+        assert env["AWS_SECRET_ACCESS_KEY"] == "SK" and env["HOTLOAD_BUCKET"] == "my-bucket"
         assert env["SAMPLER_WEIGHTS_PREFIX"] == f"cookbook/async-grpo-tool-use/runs/{launcher.run_tag}/weights"
     assert trainer.files["/workspace/run/gym.addr"] == b"tcGYM"
     passed = trainer.files["/workspace/run/inference.env"].decode()

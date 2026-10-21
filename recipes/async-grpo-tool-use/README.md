@@ -2,6 +2,8 @@
 
 Train a Qwen2.5-Math model with async GRPO on [DAPO-Math-17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k). The model writes and runs Python while it solves each problem: every rollout runs its code in its own CoreWeave sandbox. A live dashboard at a public URL shows the run from its first bring-up step to its last eval.
 
+This recipe shows the training loop; it does not keep the trained model. Checkpointing is off, and cleanup deletes the weight exports with the rest of the run. Metrics, traces and evaluations stay in W&B.
+
 ## Set up
 
 ```bash
@@ -14,24 +16,24 @@ In `.env`, set `CWSANDBOX_API_KEY` (a CoreWeave API access token from the [Token
 
 Add the lines for one option to `.env`:
 
-**1. GPU sandboxes.** No cluster. A 1.5B model, one serverless GPU sandbox for the trainer and one per sampler.
+**1. GPU sandboxes.** No cluster. A 1.5B model, one serverless GPU sandbox for the trainer and one per sampler (`SAMPLER_REPLICAS`). The bucket carries the new weights to the samplers.
 
 ```bash
 TRAINER=sandbox
 SAMPLER=vllm
-SAMPLER_REPLICAS=2              # samplers, one GPU sandbox each
-HOTLOAD_BUCKET=<your bucket>    # carries the new weights to the samplers
+SAMPLER_REPLICAS=2
+HOTLOAD_BUCKET=<your bucket>
 ```
 
-**2. SUNK + Dedicated Inference.** A 7B model on one 8x H100 SUNK node; a Dedicated Inference deployment serves the rollouts and hot-loads each new checkpoint.
+**2. SUNK + Dedicated Inference.** A 7B model on one 8x H100 SUNK node; a Dedicated Inference deployment serves the rollouts and hot-loads each new checkpoint. `SUNK_SSH_HOST` is an ssh host or `~/.ssh/config` alias.
 
 ```bash
-SUNK_SSH_HOST=<login node>      # ssh host or ~/.ssh/config alias
+SUNK_SSH_HOST=<login node>
 SUNK_DATA_DIR=/mnt/data/<you>
 HOTLOAD_BUCKET=<your bucket>
 ```
 
-**3. Bring your own compute.** Any Slurm cluster with pyxis. A 7B model; the trainer and a vLLM sampler share one 8-GPU node. No Inference access or bucket.
+**3. Bring your own compute.** A Slurm cluster with Pyxis and Enroot and nodes like SUNK's (see [Prerequisites](#prerequisites)). A 7B model; the trainer and a vLLM sampler share one 8-GPU node. No Inference access or bucket.
 
 ```bash
 TRAINER=sunk
@@ -96,9 +98,9 @@ Each rollout:
 
 1. NeMo-RL sends a math problem to the Gym agent `math_tir_agent`. Its resources server ([`gym_env/math_sandbox_eval/tir_app.py`](gym_env/math_sandbox_eval/tir_app.py)) takes a sandbox from the pool for this rollout.
 2. The agent samples from the sampler. When the model ends a turn with a ` ```python ` block, the server saves it as a file in the rollout's sandbox, runs it, and returns the output as a tool result. Up to 4 code cells per rollout.
-3. The final `\boxed{}` answer is graded with math-verify in the same sandbox. The reward is 1 for right, 0 for wrong. The sandbox goes back to the pool.
+3. The final `\boxed{}` answer is graded with math-verify in a separate grading sandbox, which receives only the expected and the extracted answer, never the model's code. The reward is 1 for right, 0 for wrong. The rollout's sandbox is then stopped, and the pool starts a fresh one: the model's code runs as root and could change anything in it, so no sandbox is reused.
 
-Each training step, the trainer trains on the finished rollouts while the next ones are generated, then exports the new weights. A background thread sends them to the sampler, which pauses the rollouts in flight, swaps the weights and resumes them. The trainer does not wait for it (`max_versions_behind: .inf` in [`config/grpo_async_qwen.yaml`](config/grpo_async_qwen.yaml)); each rollout is tagged with the weight version that produced it, and NeMo-RL's importance-sampling correction accounts for the age.
+Each training step, the trainer trains on the finished rollouts while the next ones are generated, then exports the new weights. A background thread sends them to the sampler, which pauses the rollouts in flight, swaps the weights and resumes them. The trainer never waits for it (`max_versions_behind: .inf` in [`config/grpo_async_qwen.yaml`](config/grpo_async_qwen.yaml)), so the sampler can lag the trainer by any number of versions; set a number N to make the trainer wait once the sampler is N versions behind. NeMo-RL records the trainer's weight version when a rollout is collected, not the weights the sampler actually used, and a rollout in flight during a swap mixes tokens from two versions. The loss is still correct: importance sampling compares the trainer's log probabilities with the sampler's log probability for each token, whichever weights produced it.
 
 **Evaluation and calibration** use a second Gym agent, `math_eval_agent`, with the same tool use. Before step 1 the trainer checks the verifier on known-right and known-wrong answers. AIME-2024 (30 problems, 4 samples each) runs every 10 steps and at the end.
 
@@ -114,11 +116,11 @@ Each training step, the trainer trains on the finished rollouts while the next o
 
 **GPU sandboxes** suit small models: each trainer and sampler fits on one GPU. The default model is [Qwen2.5-Math-1.5B](https://huggingface.co/Qwen/Qwen2.5-Math-1.5B) (`MODEL_REPO`) on `rtxp6000-8x` (`GPU_SANDBOX_TYPE`). More samplers generate rollouts faster; the trainer stays on one GPU, since training across sandboxes would need NCCL between them.
 
-**SUNK + Dedicated Inference** and **Bring your own compute** train [Qwen2.5-Math-7B](https://huggingface.co/Qwen/Qwen2.5-Math-7B). Option 3 works on any Slurm cluster with [pyxis](https://github.com/NVIDIA/pyxis) and enroot, not only SUNK; the settings keep the `SUNK_` prefix.
+**SUNK + Dedicated Inference** and **Bring your own compute** train [Qwen2.5-Math-7B](https://huggingface.co/Qwen/Qwen2.5-Math-7B). Option 3 is not tied to SUNK, but it has only been run on SUNK's 8x H100 nodes; the settings keep the `SUNK_` prefix.
 
 The self-hosted sampler (`async_grpo_tool_use/sampler.py`) is vLLM in dev mode with a small weight receiver. To load new weights it pauses the requests in flight, reloads the weights, resets the prefix cache and resumes, so rollouts continue on the new weights. Only the receiver's load request goes through the Tailcat tunnel; the weights go through object storage or node memory, because the tunnel is too slow for gigabytes.
 
-**Off-policy.** The dashboard's "Off-policy" value (and `step/off_policy` in W&B) is how many steps old the trained rollouts were: NeMo-RL's average trajectory age plus the versions the sampler still lagged behind the trainer when the step sampled its batch.
+**Off-policy.** The dashboard's "Off-policy" value (and `step/off_policy` in W&B) estimates how many steps old the trained rollouts were: NeMo-RL's average trajectory age plus how many versions the sampler lagged behind the trainer when the step started. It is an estimate per step, not a measurement per rollout.
 
 ## Prerequisites
 
@@ -131,19 +133,20 @@ For every option:
 **1. GPU sandboxes**
 
 - Serverless GPU capacity for 1 + `SAMPLER_REPLICAS` sandboxes.
-- A bucket in CoreWeave AI Object Storage with `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:DeleteObject` and `s3:AbortMultipartUpload` for your organization's users under the recipe's prefix (`HOTLOAD_BUCKET_PREFIX`, default `cookbook/async-grpo-tool-use/`). The launcher checks write access when it starts.
-- `cwic` (logged in), for the run's temporary storage key.
+- A bucket in CoreWeave AI Object Storage with `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` and `s3:AbortMultipartUpload` on the recipe's prefix (`HOTLOAD_BUCKET_PREFIX`, default `cookbook/async-grpo-tool-use/`), and `s3:ListBucket` and `s3:ListBucketMultipartUploads` on the bucket, for your organization's users. The launcher checks write access when it starts.
+- [`cwic`](https://github.com/coreweave/cwic) installed, for the run's temporary storage key. It runs with `CWSANDBOX_API_KEY`, so no `cwic` login is needed.
 
 **2. SUNK + Dedicated Inference**
 
 - SSH access to a SUNK login node, a partition with 8x H100 nodes (`SUNK_PARTITION`, default `h100`), and a directory on the shared filesystem.
 - [RL Rollouts](https://docs.coreweave.com/products/inference/rl-rollouts) (hot-load) enabled for your organization, the Inference Admin role on your token, and H100 capacity for Dedicated Inference in the gateway zone (`INFERENCE_ZONE`, default `US-WEST-04A`).
 - A bucket for the model and the weight snapshots, with the same [bucket policy](https://docs.coreweave.com/products/inference/getting-started#grant-inference-access-to-your-bucket) as `dapo-nemo-rl` under this recipe's prefix: read for the inference service, and the write permissions above for your organization's users.
-- `cwic` (logged in) and `rsync`.
+- `cwic` and `rsync`.
 
 **3. Bring your own compute**
 
-- SSH access to a login node of a Slurm cluster with pyxis and enroot, a partition with 8-GPU nodes, and a shared filesystem for `SUNK_DATA_DIR`.
+- SSH access to a login node of a Slurm cluster with [Pyxis](https://github.com/NVIDIA/pyxis) and Enroot, and a shared filesystem for `SUNK_DATA_DIR`.
+- Nodes like the tested ones: 8 NVIDIA H100 80GB GPUs, Linux on x86-64 (the Tailcat binary is linux amd64), a GPU driver that runs the NeMo-RL v0.7.0 container, and 112 CPUs. The job takes the whole node's memory (`--mem=0`) and keeps up to three 14 GiB weight exports in node memory. For nodes with fewer CPUs, set `SUNK_CPUS`; the trainer and the sampler each take half. Other GPUs need their own memory and parallelism settings, which this recipe does not provide.
 - Outbound internet from the nodes: the NeMo-RL image, the model and the Tailcat relay.
 - `rsync`.
 
@@ -184,7 +187,7 @@ With option 1, the gateway, Slurm and deployment lines are replaced by `trainer:
 
 - Remove `--max-num-steps` for a 20-step run. Pass NeMo-RL overrides after `--`, for example `uv run async-grpo -- grpo.num_prompts_per_step=32`.
 - `--no-share` keeps the dashboard on `localhost` only.
-- `python -m async_grpo_tool_use.launch` runs the same training without any dashboard.
+- `uv run python -m async_grpo_tool_use.launch` runs the same training without any dashboard.
 - A `PythonFinalizationError` traceback at the end comes from NeMo-RL's shutdown. It does not mean the run failed.
 - With `SAMPLER=vllm`, a `VLLMValidationError: This model's maximum context length is 3072 tokens` traceback from a sampler is a rollout that ran past the context limit. Gym ends that rollout and training continues.
 
@@ -257,7 +260,7 @@ If a step fails, the launcher prints the command to run instead. To clean up aft
 uv run python -m async_grpo_tool_use.cleanup --tag <run-tag>             # sandboxes of one run, GPU ones too
 uv run python -m async_grpo_tool_use.cleanup --tag <run-tag>-dashboard   # its dashboard
 uv run python -m async_grpo_tool_use.cleanup --all                       # every run and dashboard
-ssh sunk scancel --name=<run-tag>                                        # its Slurm job
+ssh <login node> scancel --name=<run-tag>                                # its Slurm job
 cwic inference deployment list                      # then: cwic inference deployment delete <id>
 cwic inference gateway list                         # then: cwic inference gateway delete <id>
 ```
@@ -267,10 +270,11 @@ If you created a runner, delete it when you no longer need it: `cwic sandbox run
 ## Limits
 
 - **Hot-load is in preview** and must be enabled for the organization (option 2).
-- **Stale rollouts.** Async GRPO trains on rollouts from weights up to a few versions old. NeMo-RL corrects for it with importance sampling, but it is not the same as on-policy GRPO.
+- **Stale rollouts.** Async GRPO trains on rollouts from older weights, and with `max_versions_behind: .inf` the sampler's lag has no bound: about one version while a weight load is shorter than a step, more when loads are slow. NeMo-RL corrects for it with importance sampling, but it is not the same as on-policy GRPO.
+- **No saved model.** Checkpointing is off and the weight exports are deleted at cleanup. Enable NeMo-RL's `checkpointing` settings and keep the output yourself to train a model you can use.
 - **Full snapshots.** Each step sends the full checkpoint (14 GiB for 7B, 2.9 GiB for 1.5B). Async GRPO hides this from the trainer, at the cost of staler rollouts.
 - **One GPU per trainer sandbox.** With option 1 the trainer does not span sandboxes; use option 2 or 3 for models that need a full node.
-- **Rollout code runs as written** inside its sandbox, with 15 seconds per cell. Sandboxes isolate rollouts from each other and from the trainer, and the working directory is reset between rollouts.
+- **Rollout code runs as written**, as root inside its sandbox, with 15 seconds per cell. Each rollout gets a fresh sandbox, which is stopped after it, and answers are graded in separate sandboxes, so a rollout's code cannot change another rollout or its own reward.
 - **Tool calls are read from text.** The deployment drops the ` ``` ` stop sequence, so the server finds code blocks in the model's text instead of relying on stop tokens.
 - **The dashboard URL is public.** Anyone with it can watch the run; nobody can change it. Stop it with Ctrl+C or the cleanup command when you are done.
 - **Eval step labels are inferred.** The Gym server does not know the trainer's step; it labels eval rounds by order, every `val_period` steps and at the last one.

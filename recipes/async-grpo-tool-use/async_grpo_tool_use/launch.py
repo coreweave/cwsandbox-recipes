@@ -43,8 +43,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from async_grpo_tool_use import env_file
 from async_grpo_tool_use.dapo_data import AIME_PROBLEMS, EVAL_REPEATS
-from async_grpo_tool_use.inference import DeploymentSettings, Inference, deployment_spec
+from async_grpo_tool_use.inference import DeploymentSettings, Inference, cwic_runner, deployment_spec
 from async_grpo_tool_use.sunk import Sunk
 from async_grpo_tool_use.trainer_sandbox import EXIT_LINE
 
@@ -67,7 +68,7 @@ FORWARDED_ENV = ("MAX_NUM_STEPS", "DAPO_MAX_SAMPLES", "HF_TOKEN", "GYM_REMOTE_CO
 # metrics and the share of training rollouts traced in Agent Lens.
 GYM_FORWARDED_ENV = (
     "SANDBOX_POOL_MIN", "SANDBOX_POOL_MAX", "SANDBOX_POOL_IDLE_S", "SANDBOX_PLACEMENT", "DASHBOARD_METRICS",
-    "AGENT_LENS_SAMPLE",
+    "GRADER_POOL_SIZE", "AGENT_LENS_SAMPLE",
 )  # fmt: skip
 ACTIVE_STATES = ("PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "REQUEUED")
 
@@ -118,10 +119,11 @@ class LaunchConfig:
     sampler_cpu: str = "8"
     sampler_replicas: int = 1  # sampler sandboxes, one GPU each (TRAINER=sandbox)
     sampler_memory: str = "32Gi"
-    bucket: str = "gradient-hotloading"
+    bucket: str = ""
     bucket_prefix: str = "cookbook/async-grpo-tool-use"  # the inference service must be able to read it
     deployment: DeploymentSettings = field(default_factory=DeploymentSettings)
     partition: str = "h100"
+    cpus: int = 112  # CPUs per 8-GPU node for the job; the trainer and sampler steps split them
     time_limit: str = "12:00:00"
     gym_cpu: str = "8"
     gym_memory: str = "32Gi"
@@ -218,7 +220,7 @@ class Launcher:
         if inference is None:
             from cwtrain import InferenceClient
 
-            inference = Inference(InferenceClient(token=config.api_token))
+            inference = Inference(InferenceClient(token=config.api_token), cwic_runner(config.api_token))
         self.inference = inference
         self.s3_factory = s3_factory
         self.sink = sink or (lambda line: print(line, end="", flush=True))
@@ -234,6 +236,7 @@ class Launcher:
         self.sampler_gpus = 0  # GPUs of the self-hosted sampler, once it serves
         self.job_id: str | None = None
         self.tail: Any = None
+        self.staged = False  # secrets and the Gym address written to the run directory
         self.access_key: dict[str, str] | None = None
         self.bucket_zone = ""
         self.gateway_id: str | None = None
@@ -253,7 +256,8 @@ class Launcher:
         log(f"storage: temporary access key can write {uri}")
 
     def create_gateway(self) -> None:
-        self.gateway_id, self.endpoint = self.inference.create_gateway(self.run_tag, self.config.deployment.zone)
+        self.gateway_id = self.inference.create_gateway(self.run_tag, self.config.deployment.zone)
+        self.endpoint = self.inference.wait_gateway(self.gateway_id)
         log(f"inference: gateway {self.gateway_id} ready at {self.endpoint}")
 
     def create_deployment(self) -> None:
@@ -410,11 +414,12 @@ class Launcher:
         sunk, run_dir = self.sunk, self.run_dir
         root = self.config.project_root
         sunk.sync([root / d.rstrip("/") for d in MOUNT_DIRS], f"{run_dir}/code")
+        self.staged = True  # from here on cleanup removes the secrets, even if sbatch fails
         sunk.write_private(f"{run_dir}/secrets.env", self.secrets_env())
         sunk.write_private(f"{run_dir}/gym.addr", gym_address.encode())
         self.job_id = sunk.submit(
             [
-                f"--partition={self.config.partition}", "--nodes=1", "--gres=gpu:8", "--cpus-per-task=112", "--mem=0",
+                f"--partition={self.config.partition}", "--nodes=1", "--gres=gpu:8", f"--cpus-per-task={self.config.cpus}", "--mem=0",
                 f"--time={self.config.time_limit}", f"--job-name={self.run_tag}", f"--output={run_dir}/job.log",
                 f"--chdir={run_dir}",
             ],
@@ -571,20 +576,25 @@ class Launcher:
         if self.tail is not None:
             self.tail.terminate()
         if self.job_id:
-            run_dir = shlex.quote(self.run_dir)
 
             def cancel() -> None:
                 self.sunk.cancel(self.job_id)
-                # Tokens, keys and endpoints; the logs stay.
-                self.sunk.run(f"rm -f {run_dir}/secrets.env {run_dir}/inference.env {run_dir}/*.addr", check=False)
                 log(f"sunk: job {self.job_id} cancelled")
 
             step("cancel the Slurm job", cancel, f"ssh {self.sunk.host} scancel {self.job_id}")
+        if self.staged:
+            run_dir = shlex.quote(self.run_dir)
+
+            def remove_secrets() -> None:  # tokens, keys and endpoints; the logs stay
+                self.sunk.run(f"rm -f {run_dir}/secrets.env {run_dir}/inference.env {run_dir}/*.addr")
+
+            step("remove the run's secrets", remove_secrets,
+                 f"ssh {self.sunk.host} rm -f {self.run_dir}/secrets.env {self.run_dir}/*.addr")  # fmt: skip
 
         def stop_sandboxes() -> None:  # the Gym sandbox and the rollout sandboxes it started
             log(f"stopped {stop_tagged(self.sdk, self.run_tag)} sandbox(es)")
 
-        step("stop sandboxes", stop_sandboxes, f"python -m async_grpo_tool_use.cleanup --tag {self.run_tag}")
+        step("stop sandboxes", stop_sandboxes, f"uv run python -m async_grpo_tool_use.cleanup --tag {self.run_tag}")
         if self.deployment_id:  # before the gateway, which cannot be deleted while in use
 
             def delete_deployment() -> None:
@@ -733,6 +743,7 @@ def config_from_env(args: argparse.Namespace, environ: dict[str, str]) -> Launch
             replicas=int(environ.get("INFERENCE_REPLICAS", defaults.replicas)),
         ),
         partition=environ.get("SUNK_PARTITION", "h100"),
+        cpus=int(environ.get("SUNK_CPUS", "112")),
         hydra_overrides=tuple(args.overrides),
         env={**env, **wandb},
         gym_env={**gym_env, **wandb},
@@ -746,8 +757,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-num-steps", type=int, default=None)
     parser.add_argument("overrides", nargs="*", help="Hydra overrides for NeMo-RL (after --)")
     args = parser.parse_args(argv)
+    env_file.load()
     if not os.environ.get("CWSANDBOX_API_KEY"):
-        print("set CWSANDBOX_API_KEY (a CoreWeave API access token)", file=sys.stderr)
+        print("set CWSANDBOX_API_KEY (a CoreWeave API access token) in .env", file=sys.stderr)
         return 2
     # cwic runs as a subprocess next to cwsandbox's gRPC client; keep gRPC's fork notices quiet.
     os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
