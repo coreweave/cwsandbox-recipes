@@ -1,0 +1,50 @@
+# Tool-integrated reasoning: each rollout gets a fresh CoreWeave sandbox, runs its python
+# cells there and is graded in a separate grading sandbox (tir_app.py). Replaces math_sandbox_eval.yaml when DAPO_TIR=1,
+# so the server keeps its name (the trainer's /calibrate call and run_gym's port overlay find it).
+# run_gym.py sets the host, the ports and the runner.
+math_sandbox_eval:
+  resources_servers:
+    math_sandbox_eval:
+      entrypoint: tir_app.py
+      sandbox:
+        cwsandbox:
+          runner_id: ${oc.env:CWSANDBOX_RUNNER_ID}
+          placement: ${oc.env:SANDBOX_PLACEMENT,serverless}
+          tags: [async-grpo, "${oc.env:RUN_TAG}"]
+      # A warm pool by default: about one sandbox per rollout in flight (remote_concurrency).
+      pool_size: ${oc.env:SANDBOX_POOL_MIN,256}
+      max_pool_size: ${oc.env:SANDBOX_POOL_MAX,256}
+      idle_timeout_s: ${oc.env:SANDBOX_POOL_IDLE_S,20}
+      grader_pool_size: ${oc.env:GRADER_POOL_SIZE,8}
+      cpu: 1
+      memory_mib: 2048
+      setup_command: pip install --quiet --no-cache-dir math-verify==0.8.0 numpy sympy
+      cell_timeout_s: 15
+      max_output_chars: 512
+      domain: math
+      verified: false
+      description: Tool-integrated math reasoning, one CoreWeave sandbox per episode
+# Training rows. max_steps is the turn limit: up to 4 executed cells, then a final answer.
+math_tir_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: math_sandbox_eval
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 5
+# Evaluation rows (AIME-2024), same environment.
+math_eval_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: math_sandbox_eval
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: 5
